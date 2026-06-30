@@ -163,18 +163,18 @@ impl SymbolTracker {
             let (should_exit, exit_price) = match trade.direction {
                 TradeDirection::Long => {
                     if low <= trade.sl {
-                        (true, trade.sl)
+                        (true, low) // SL fill at worst price (low breached)
                     } else if high >= trade.tp {
-                        (true, trade.tp)
+                        (true, trade.tp) // TP limit fills at target
                     } else {
                         (false, 0.0)
                     }
                 }
                 TradeDirection::Short => {
                     if high >= trade.sl {
-                        (true, trade.sl)
+                        (true, high) // SL fill at worst price (high breached)
                     } else if low <= trade.tp {
-                        (true, trade.tp)
+                        (true, trade.tp) // TP limit fills at target
                     } else {
                         (false, 0.0)
                     }
@@ -198,9 +198,9 @@ impl SymbolTracker {
         if self.active_trade.is_none() && curr_level != prev_level {
             if curr_level > prev_level {
                 // price moved up → enter SHORT (mean reversion)
-                let entry_price = self.level_to_price(curr_level);
-                let sl = self.level_to_price(curr_level + 3); // risk 1.5%
-                let tp = self.level_to_price(curr_level - 1); // reward 0.5%
+                let entry_price = close;
+                let sl = entry_price * 1.015; // -1.5%
+                let tp = entry_price * 0.995; // +0.5%
                 self.active_trade = Some(GridTrade {
                     symbol: self.symbol.clone(),
                     level: curr_level,
@@ -221,9 +221,9 @@ impl SymbolTracker {
                 });
             } else {
                 // price moved down → enter LONG (mean reversion)
-                let entry_price = self.level_to_price(curr_level);
-                let sl = self.level_to_price(curr_level - 3); // risk 1.5%
-                let tp = self.level_to_price(curr_level + 1); // reward 0.5%
+                let entry_price = close;
+                let sl = entry_price * 0.985; // -1.5%
+                let tp = entry_price * 1.005; // +0.5%
                 self.active_trade = Some(GridTrade {
                     symbol: self.symbol.clone(),
                     level: curr_level,
@@ -256,18 +256,18 @@ impl SymbolTracker {
             let (should_exit, exit_price) = match trade.direction {
                 TradeDirection::Long => {
                     if price <= trade.sl {
-                        (true, trade.sl)
+                        (true, price) // SL fill at current mark price
                     } else if price >= trade.tp {
-                        (true, trade.tp)
+                        (true, trade.tp) // TP limit fills at target
                     } else {
                         (false, 0.0)
                     }
                 }
                 TradeDirection::Short => {
                     if price >= trade.sl {
-                        (true, trade.sl)
+                        (true, price) // SL fill at current mark price
                     } else if price <= trade.tp {
-                        (true, trade.tp)
+                        (true, trade.tp) // TP limit fills at target
                     } else {
                         (false, 0.0)
                     }
@@ -293,9 +293,9 @@ impl SymbolTracker {
             if let Some(prev) = self.last_close_level {
                 if curr > prev {
                     // price moved up → SHORT (mean reversion)
-                    let entry_price = self.level_to_price(curr);
-                    let sl = self.level_to_price(curr + 3); // risk 1.5%
-                    let tp = self.level_to_price(curr - 1); // reward 0.5%
+                    let entry_price = price;
+                    let sl = entry_price * 1.015; // -1.5%
+                    let tp = entry_price * 0.995; // +0.5%
                     self.active_trade = Some(GridTrade {
                         symbol: self.symbol.clone(),
                         level: curr,
@@ -317,9 +317,9 @@ impl SymbolTracker {
                     self.last_close_level = Some(curr);
                 } else if curr < prev {
                     // price moved down → LONG (mean reversion)
-                    let entry_price = self.level_to_price(curr);
-                    let sl = self.level_to_price(curr - 3); // risk 1.5%
-                    let tp = self.level_to_price(curr + 1); // reward 0.5%
+                    let entry_price = price;
+                    let sl = entry_price * 0.985; // -1.5%
+                    let tp = entry_price * 1.005; // +0.5%
                     self.active_trade = Some(GridTrade {
                         symbol: self.symbol.clone(),
                         level: curr,
@@ -569,9 +569,14 @@ impl RealtimeEngine {
             }
         } else if let Some(sym) = topic.strip_prefix("tickers.") {
             let price = data
-                .get("lastPrice")
+                .get("markPrice")
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| {
+                    data.get("lastPrice")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                })
                 .or_else(|| {
                     let bid = data
                         .get("bid1Price")
@@ -582,11 +587,6 @@ impl RealtimeEngine {
                         .and_then(|v| v.as_str())
                         .and_then(|s| s.parse::<f64>().ok());
                     bid.zip(ask).map(|(b, a)| (b + a) / 2.0)
-                })
-                .or_else(|| {
-                    data.get("markPrice")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<f64>().ok())
                 });
 
             if let Some(p) = price {
@@ -1498,7 +1498,14 @@ impl RealtimeEngine {
                     TradeDirection::Short => low <= tp,
                 };
                 if hit_sl || hit_tp {
-                    let exit_price = if hit_sl { sl } else { tp };
+                    let exit_price = if hit_sl {
+                        match dir {
+                            TradeDirection::Long => low,
+                            TradeDirection::Short => high,
+                        }
+                    } else {
+                        tp
+                    };
                     let pnl = match dir {
                         TradeDirection::Long => (exit_price - _entry) / _entry * 100.0,
                         TradeDirection::Short => (_entry - exit_price) / _entry * 100.0,
@@ -1517,16 +1524,16 @@ impl RealtimeEngine {
             if active.is_none() && curr_level != prev_level {
                 if curr_level > prev_level {
                     // short (mean reversion) — risk 1.5%, reward 0.5%
-                    let entry = price_for_level(curr_level, base_price);
-                    let sl = price_for_level(curr_level + 3, base_price);
-                    let tp = price_for_level(curr_level - 1, base_price);
+                    let entry = k.close;
+                    let sl = entry * 1.015;
+                    let tp = entry * 0.995;
                     active = Some((TradeDirection::Short, entry, sl, tp));
                     total_trades += 1;
                 } else {
                     // long (mean reversion) — risk 1.5%, reward 0.5%
-                    let entry = price_for_level(curr_level, base_price);
-                    let sl = price_for_level(curr_level - 3, base_price);
-                    let tp = price_for_level(curr_level + 1, base_price);
+                    let entry = k.close;
+                    let sl = entry * 0.985;
+                    let tp = entry * 1.005;
                     active = Some((TradeDirection::Long, entry, sl, tp));
                     total_trades += 1;
                 }
