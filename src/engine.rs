@@ -505,13 +505,19 @@ impl RealtimeEngine {
     pub fn resolve_symbol(sym: &str) -> String {
         let s = sym.trim().to_uppercase();
         if s.contains('/') {
-            return s.replace("/USDT:USDT", "").replace("/USDT", "");
+            return s
+                .replace("/USDT:USDT", "")
+                .replace("/USDT", "")
+                .replace("/USDC:USDC", "")
+                .replace("/USDC", "");
         }
         if s.ends_with("USDT") && s.len() > 4 {
-            s
-        } else {
-            format!("{s}USDT")
+            return s;
         }
+        if s.ends_with("USDC") && s.len() > 4 {
+            return s;
+        }
+        format!("{s}USDT")
     }
 
     // ─── WS Handling ──────────────────────────────────────────────────

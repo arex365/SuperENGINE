@@ -153,7 +153,7 @@ pub async fn fetch_active_perps() -> Result<Vec<String>, String> {
     let mut symbols = Vec::new();
     for item in list {
         if let Some(sym) = item["symbol"].as_str() {
-            if sym.ends_with("USDT") {
+            if sym.ends_with("USDT") || sym.ends_with("USDC") {
                 symbols.push(sym.to_string());
             }
         }
