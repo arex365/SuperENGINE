@@ -188,6 +188,7 @@ impl SymbolTracker {
                 self.closed_trades.push(t.clone());
                 events.push(TrackerEvent::Exited {
                     symbol: self.symbol.clone(),
+                    direction: t.direction,
                     level: t.level,
                 });
             }
@@ -280,6 +281,7 @@ impl SymbolTracker {
                 self.closed_trades.push(t.clone());
                 events.push(TrackerEvent::Exited {
                     symbol: self.symbol.clone(),
+                    direction: t.direction,
                     level: t.level,
                 });
             }
@@ -359,6 +361,7 @@ pub enum TrackerEvent {
     },
     Exited {
         symbol: String,
+        direction: TradeDirection,
         level: i32,
     },
 }
@@ -474,16 +477,14 @@ impl RealtimeEngine {
             let qty = if price > 0.0 { sub.size / price } else { sub.size };
             let sym = symbol.clone();
             let sid = sub.sub_id;
-            tokio::spawn(async move {
-                match direction {
-                    TradeDirection::Long => trade_manager::open_long(sym, qty, sid).await,
-                    TradeDirection::Short => trade_manager::open_short(sym, qty, sid).await,
-                }
-            });
+            match direction {
+                TradeDirection::Long => trade_manager::open_long(sym, qty, sid),
+                TradeDirection::Short => trade_manager::open_short(sym, qty, sid),
+            }
         }
     }
 
-    fn on_exit_position(self: &Arc<Self>, symbol: String) {
+    fn on_exit_position(self: &Arc<Self>, symbol: String, direction: TradeDirection) {
         let subs = {
             let subs = self.subscribers.read().unwrap();
             subs.values().cloned().collect::<Vec<_>>()
@@ -491,9 +492,10 @@ impl RealtimeEngine {
         for sub in subs {
             let sym = symbol.clone();
             let sid = sub.sub_id;
-            tokio::spawn(async move {
-                trade_manager::close_all_positions(sym, sid).await;
-            });
+            match direction {
+                TradeDirection::Long => trade_manager::close_long(sym, sid),
+                TradeDirection::Short => trade_manager::close_short(sym, sid),
+            }
         }
     }
 
@@ -558,8 +560,8 @@ impl RealtimeEngine {
                             } => {
                                 self.on_enter_position(s, d, price);
                             }
-                            TrackerEvent::Exited { symbol: s, .. } => {
-                                self.on_exit_position(s);
+                            TrackerEvent::Exited { symbol: s, direction: d, .. } => {
+                                self.on_exit_position(s, d);
                             }
                         }
                     }
@@ -605,8 +607,8 @@ impl RealtimeEngine {
                         } => {
                             self.on_enter_position(s, d, price);
                         }
-                        TrackerEvent::Exited { symbol: s, .. } => {
-                            self.on_exit_position(s);
+                        TrackerEvent::Exited { symbol: s, direction: d, .. } => {
+                            self.on_exit_position(s, d);
                         }
                     }
                 }
