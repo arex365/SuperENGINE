@@ -248,26 +248,28 @@ impl SymbolTracker {
         events
     }
 
-    pub fn update_ticker(&mut self, price: f64) -> Vec<TrackerEvent> {
-        self.current_price = Some(price);
+    pub fn update_ticker(&mut self, bid: f64, ask: f64) -> Vec<TrackerEvent> {
+        self.current_price = Some((bid + ask) / 2.0); // mid for display
         let mut events = Vec::new();
 
         if let Some(ref trade) = self.active_trade {
             let (should_exit, exit_price) = match trade.direction {
                 TradeDirection::Long => {
-                    if price <= trade.sl {
-                        (true, price) // SL fill at current mark price
-                    } else if price >= trade.tp {
-                        (true, trade.tp) // TP limit fills at target
+                    // LONG sells at bid
+                    if bid <= trade.sl {
+                        (true, bid)
+                    } else if bid >= trade.tp {
+                        (true, trade.tp)
                     } else {
                         (false, 0.0)
                     }
                 }
                 TradeDirection::Short => {
-                    if price >= trade.sl {
-                        (true, price) // SL fill at current mark price
-                    } else if price <= trade.tp {
-                        (true, trade.tp) // TP limit fills at target
+                    // SHORT buys back at ask
+                    if ask >= trade.sl {
+                        (true, ask)
+                    } else if ask <= trade.tp {
+                        (true, trade.tp)
                     } else {
                         (false, 0.0)
                     }
@@ -289,13 +291,14 @@ impl SymbolTracker {
 
         // Entry on ticker (no active trade + direction from level change)
         if self.active_trade.is_none() {
-            let curr = self.price_to_level(price);
+            let mid = (bid + ask) / 2.0;
+            let curr = self.price_to_level(mid);
             if let Some(prev) = self.last_close_level {
                 if curr > prev {
-                    // price moved up → SHORT (mean reversion)
-                    let entry_price = price;
-                    let sl = entry_price * 1.015; // -1.5%
-                    let tp = entry_price * 0.995; // +0.5%
+                    // SHORT: sell at bid
+                    let entry_price = bid;
+                    let sl = entry_price * 1.015;
+                    let tp = entry_price * 0.995;
                     self.active_trade = Some(GridTrade {
                         symbol: self.symbol.clone(),
                         level: curr,
@@ -316,10 +319,10 @@ impl SymbolTracker {
                     });
                     self.last_close_level = Some(curr);
                 } else if curr < prev {
-                    // price moved down → LONG (mean reversion)
-                    let entry_price = price;
-                    let sl = entry_price * 0.985; // -1.5%
-                    let tp = entry_price * 1.005; // +0.5%
+                    // LONG: buy at ask
+                    let entry_price = ask;
+                    let sl = entry_price * 0.985;
+                    let tp = entry_price * 1.005;
                     self.active_trade = Some(GridTrade {
                         symbol: self.symbol.clone(),
                         level: curr,
@@ -568,33 +571,21 @@ impl RealtimeEngine {
                 }
             }
         } else if let Some(sym) = topic.strip_prefix("tickers.") {
-            let price = data
-                .get("markPrice")
+            let bid = data
+                .get("bid1Price")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok())
-                .or_else(|| {
-                    data.get("lastPrice")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<f64>().ok())
-                })
-                .or_else(|| {
-                    let bid = data
-                        .get("bid1Price")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<f64>().ok());
-                    let ask = data
-                        .get("ask1Price")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<f64>().ok());
-                    bid.zip(ask).map(|(b, a)| (b + a) / 2.0)
-                });
+                .and_then(|s| s.parse::<f64>().ok());
+            let ask = data
+                .get("ask1Price")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok());
 
-            if let Some(p) = price {
+            if let (Some(b), Some(a)) = (bid, ask) {
                 let events = {
                     let mut trackers = self.trackers.write().unwrap();
                     trackers
                         .get_mut(sym)
-                        .map(|tr| tr.update_ticker(p))
+                        .map(|tr| tr.update_ticker(b, a))
                         .unwrap_or_default()
                 };
                 for ev in events {
