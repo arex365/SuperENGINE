@@ -149,7 +149,7 @@ async fn view_trades(
     }
 }
 
-async fn get_recommended_coins(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+async fn get_recommended_coins(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let symbols = match trade_manager::fetch_active_perps().await {
         Ok(s) => s,
         Err(e) => return Json(json!({"error": e})).into_response(),
@@ -157,6 +157,8 @@ async fn get_recommended_coins(State(_state): State<Arc<AppState>>) -> impl Into
 
     // filter to top 100 by volume (approximate — the ticker list is already sorted)
     let candidates: Vec<String> = symbols.into_iter().take(100).collect();
+
+    let (sl_pct, tp_pct, _) = state.engine.get_config();
 
     let mut handles = Vec::new();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
@@ -181,7 +183,7 @@ async fn get_recommended_coins(State(_state): State<Arc<AppState>>) -> impl Into
             };
             match trade_manager::fetch_historical_klines(&sym_clone, 5, 576).await {
                 Ok(klines) if klines.len() >= 50 => {
-                    score = engine::RealtimeEngine::score_symbol_grid(&klines);
+                    score = engine::RealtimeEngine::score_symbol_grid_with_config(&klines, sl_pct, tp_pct);
                     score.symbol = sym_clone;
                 }
                 _ => {}
@@ -204,6 +206,107 @@ async fn get_recommended_coins(State(_state): State<Arc<AppState>>) -> impl Into
 
     Json(json!(results)).into_response()
 }
+async fn config_page(State(state): State<Arc<AppState>>) -> Html<String> {
+    let (sl, tp, rev) = state.engine.get_config();
+    let html = format!(
+        r#"<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>Config — Grid Engine</title>
+<style>
+  * {{ box-sizing:border-box; margin:0; padding:0 }}
+  body {{ font-family:Segoe UI,sans-serif; background:#0d1117; color:#c9d1d9; padding:30px; max-width:700px; margin:0 auto }}
+  h1,h2 {{ color:#f0f6fc; margin:24px 0 12px }}
+  a {{ color:#58a6ff; text-decoration:none }} a:hover {{ text-decoration:underline }}
+  .card {{ background:#161b22; border:1px solid #30363d; border-radius:8px; padding:20px; margin:16px 0 }}
+  .card h3 {{ margin:0 0 16px }}
+  form {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap }}
+  label {{ color:#8b949e; font-size:0.9em }}
+  input[type=number] {{ padding:8px 12px; border-radius:6px; border:1px solid #30363d; background:#21262d; color:#c9d1d9; font-size:0.95em; width:80px }}
+  button {{ padding:8px 16px; border-radius:6px; border:1px solid #30363d; background:#21262d; color:#c9d1d9; cursor:pointer; font-weight:600 }}
+  button:hover {{ background:#30363d }}
+  .btn-green {{ border-color:#4caf50; color:#4caf50 }}
+  .btn-red {{ border-color:#ef5350; color:#ef5350 }}
+  .nav {{ display:flex; gap:16px; margin-bottom:20px }}
+  .nav a {{ padding:6px 0; border-bottom:2px solid transparent }}
+  .nav a.active {{ border-color:#58a6ff }}
+  .current {{ background:#0d1117; border:1px solid #30363d; border-radius:6px; padding:14px 18px; margin:12px 0 }}
+  .current .row {{ display:flex; justify-content:space-between; padding:6px 0 }}
+  .current .val {{ color:#f0f6fc; font-weight:600 }}
+  .toggle {{ display:flex; align-items:center; gap:10px }}
+  .toggle input {{ width:20px; height:20px; cursor:pointer }}
+</style>
+</head>
+<body>
+<div class="nav">
+  <a href="/">Dashboard</a>
+  <a href="/subs">Manage</a>
+  <a href="/config" class="active">Config</a>
+  <a href="/state">State</a>
+</div>
+<h1>Engine Configuration</h1>
+
+<div class="current">
+  <div class="row"><span>Stop Loss</span><span class="val">{sl}%</span></div>
+  <div class="row"><span>Take Profit</span><span class="val">{tp}%</span></div>
+  <div class="row"><span>Reverse Mode</span><span class="val">{rev}</span></div>
+</div>
+
+<div class="card">
+  <h3>Set SL / TP Percentages</h3>
+  <form action="/setConfig" method="get">
+    <label>SL %:</label><input type="number" name="sl" step="0.1" min="0.1" value="{sl}">
+    <label>TP %:</label><input type="number" name="tp" step="0.1" min="0.1" value="{tp}">
+    <button type="submit" class="btn-green">Apply</button>
+  </form>
+</div>
+
+<div class="card">
+  <h3>Reverse Mode</h3>
+  <p style="color:#8b949e;font-size:0.85em;margin-bottom:12px">
+    When enabled, entry direction is inverted: a long signal becomes short and vice versa.
+    Bid/ask prices swap accordingly (long buys at ask, short sells at bid).
+  </p>
+  <div class="toggle">
+    <form action="/setReverse" method="get">
+      <input type="hidden" name="enabled" value="{toggle_to}">
+      <button type="submit" class="{btn_cls}">{btn_txt}</button>
+    </form>
+    <span style="color:#8b949e;font-size:0.85em">{rev_status}</span>
+  </div>
+</div>
+
+<p><a href="/">← Back to dashboard</a></p>
+</body></html>"#,
+        sl = sl,
+        tp = tp,
+        rev = if rev { "ON" } else { "OFF" },
+        toggle_to = if rev { "false" } else { "true" },
+        btn_cls = if rev { "btn-red" } else { "btn-green" },
+        btn_txt = if rev { "Disable Reverse" } else { "Enable Reverse" },
+        rev_status = if rev { "Reverse mode is active — entry directions are inverted." } else { "Normal mode — standard mean-reversion logic." },
+    );
+    Html(html)
+}
+
+async fn set_config_route(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let sl: f64 = params.get("sl").and_then(|s| s.parse().ok()).unwrap_or(1.5);
+    let tp: f64 = params.get("tp").and_then(|s| s.parse().ok()).unwrap_or(0.5);
+    state.engine.set_config(sl.clamp(0.1, 50.0), tp.clamp(0.1, 50.0));
+    Html(state.engine.generate_dashboard())
+}
+
+async fn set_reverse_route(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let enabled = params.get("enabled").map(|s| s == "true").unwrap_or(false);
+    state.engine.set_reverse_mode(enabled);
+    Html(state.engine.generate_dashboard())
+}
+
 async fn ping(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let trackers = state.engine.all_trackers();
     let mut data = serde_json::Map::new();
@@ -268,6 +371,12 @@ async fn main() {
         .route("/flush/", get(flush))
         .route("/viewtrades/:symbol", get(view_trades))
         .route("/viewtrades/:symbol/", get(view_trades))
+        .route("/config", get(config_page))
+        .route("/config/", get(config_page))
+        .route("/setConfig", get(set_config_route))
+        .route("/setConfig/", get(set_config_route))
+        .route("/setReverse", get(set_reverse_route))
+        .route("/setReverse/", get(set_reverse_route))
         .route("/getRecommendedCoins", get(get_recommended_coins))
         .route("/ping", get(ping))
         .with_state(app_state);

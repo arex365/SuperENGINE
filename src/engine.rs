@@ -140,7 +140,7 @@ impl SymbolTracker {
         self.closed_trades.len() + if self.active_trade.is_some() { 1 } else { 0 }
     }
 
-    pub fn process_kline(&mut self, kline: &KlineData) -> Vec<TrackerEvent> {
+    pub fn process_kline(&mut self, kline: &KlineData, sl_pct: f64, tp_pct: f64, reverse: bool) -> Vec<TrackerEvent> {
         let close = kline.close;
         let high = kline.high;
         let low = kline.low;
@@ -196,63 +196,55 @@ impl SymbolTracker {
 
         // ── Check entry (level crossing, at most 1 active trade) ──
         if self.active_trade.is_none() && curr_level != prev_level {
-            if curr_level > prev_level {
-                // price moved up → enter SHORT (mean reversion)
-                let entry_price = close;
-                let sl = entry_price * 1.015; // -1.5%
-                let tp = entry_price * 0.995; // +0.5%
-                self.active_trade = Some(GridTrade {
-                    symbol: self.symbol.clone(),
-                    level: curr_level,
-                    direction: TradeDirection::Short,
-                    entry_time: dt,
-                    entry_price,
-                    sl,
-                    tp,
-                    exit_time: None,
-                    exit_price: None,
-                    status: TradeStatus::Open,
-                });
-                events.push(TrackerEvent::Entered {
-                    symbol: self.symbol.clone(),
-                    direction: TradeDirection::Short,
-                    price: entry_price,
-                    level: curr_level,
-                    sl,
-                    tp,
-                });
+            let (direction, entry_price) = if curr_level > prev_level {
+                // price moved up → enter SHORT (mean reversion), or LONG if reversed
+                if reverse {
+                    (TradeDirection::Long, close)
+                } else {
+                    (TradeDirection::Short, close)
+                }
             } else {
-                // price moved down → enter LONG (mean reversion)
-                let entry_price = close;
-                let sl = entry_price * 0.985; // -1.5%
-                let tp = entry_price * 1.005; // +0.5%
-                self.active_trade = Some(GridTrade {
-                    symbol: self.symbol.clone(),
-                    level: curr_level,
-                    direction: TradeDirection::Long,
-                    entry_time: dt,
-                    entry_price,
-                    sl,
-                    tp,
-                    exit_time: None,
-                    exit_price: None,
-                    status: TradeStatus::Open,
-                });
-                events.push(TrackerEvent::Entered {
-                    symbol: self.symbol.clone(),
-                    direction: TradeDirection::Long,
-                    price: entry_price,
-                    level: curr_level,
-                    sl,
-                    tp,
-                });
-            }
+                // price moved down → enter LONG (mean reversion), or SHORT if reversed
+                if reverse {
+                    (TradeDirection::Short, close)
+                } else {
+                    (TradeDirection::Long, close)
+                }
+            };
+            let (sl, tp) = match direction {
+                TradeDirection::Long => {
+                    (entry_price * (1.0 - sl_pct / 100.0), entry_price * (1.0 + tp_pct / 100.0))
+                }
+                TradeDirection::Short => {
+                    (entry_price * (1.0 + sl_pct / 100.0), entry_price * (1.0 - tp_pct / 100.0))
+                }
+            };
+            self.active_trade = Some(GridTrade {
+                symbol: self.symbol.clone(),
+                level: curr_level,
+                direction,
+                entry_time: dt,
+                entry_price,
+                sl,
+                tp,
+                exit_time: None,
+                exit_price: None,
+                status: TradeStatus::Open,
+            });
+            events.push(TrackerEvent::Entered {
+                symbol: self.symbol.clone(),
+                direction,
+                price: entry_price,
+                level: curr_level,
+                sl,
+                tp,
+            });
         }
 
         events
     }
 
-    pub fn update_ticker(&mut self, bid: f64, ask: f64) -> Vec<TrackerEvent> {
+    pub fn update_ticker(&mut self, bid: f64, ask: f64, sl_pct: f64, tp_pct: f64, reverse: bool) -> Vec<TrackerEvent> {
         self.current_price = Some((bid + ask) / 2.0); // mid for display
         let mut events = Vec::new();
 
@@ -299,14 +291,24 @@ impl SymbolTracker {
             let curr = self.price_to_level(mid);
             if let Some(prev) = self.last_close_level {
                 if curr > prev {
-                    // SHORT: sell at bid
-                    let entry_price = bid;
-                    let sl = entry_price * 1.015;
-                    let tp = entry_price * 0.995;
+                    // price moved up → SHORT (sell at bid), or LONG if reversed
+                    let (direction, entry_price) = if reverse {
+                        (TradeDirection::Long, ask)
+                    } else {
+                        (TradeDirection::Short, bid)
+                    };
+                    let (sl, tp) = match direction {
+                        TradeDirection::Long => {
+                            (entry_price * (1.0 - sl_pct / 100.0), entry_price * (1.0 + tp_pct / 100.0))
+                        }
+                        TradeDirection::Short => {
+                            (entry_price * (1.0 + sl_pct / 100.0), entry_price * (1.0 - tp_pct / 100.0))
+                        }
+                    };
                     self.active_trade = Some(GridTrade {
                         symbol: self.symbol.clone(),
                         level: curr,
-                        direction: TradeDirection::Short,
+                        direction,
                         entry_time: Utc::now(),
                         entry_price,
                         sl,
@@ -317,7 +319,7 @@ impl SymbolTracker {
                     });
                     events.push(TrackerEvent::Entered {
                         symbol: self.symbol.clone(),
-                        direction: TradeDirection::Short,
+                        direction,
                         price: entry_price,
                         level: curr,
                         sl,
@@ -325,14 +327,24 @@ impl SymbolTracker {
                     });
                     self.last_close_level = Some(curr);
                 } else if curr < prev {
-                    // LONG: buy at ask
-                    let entry_price = ask;
-                    let sl = entry_price * 0.985;
-                    let tp = entry_price * 1.005;
+                    // price moved down → LONG (buy at ask), or SHORT if reversed
+                    let (direction, entry_price) = if reverse {
+                        (TradeDirection::Short, bid)
+                    } else {
+                        (TradeDirection::Long, ask)
+                    };
+                    let (sl, tp) = match direction {
+                        TradeDirection::Long => {
+                            (entry_price * (1.0 - sl_pct / 100.0), entry_price * (1.0 + tp_pct / 100.0))
+                        }
+                        TradeDirection::Short => {
+                            (entry_price * (1.0 + sl_pct / 100.0), entry_price * (1.0 - tp_pct / 100.0))
+                        }
+                    };
                     self.active_trade = Some(GridTrade {
                         symbol: self.symbol.clone(),
                         level: curr,
-                        direction: TradeDirection::Long,
+                        direction,
                         entry_time: Utc::now(),
                         entry_price,
                         sl,
@@ -343,7 +355,7 @@ impl SymbolTracker {
                     });
                     events.push(TrackerEvent::Entered {
                         symbol: self.symbol.clone(),
-                        direction: TradeDirection::Long,
+                        direction,
                         price: entry_price,
                         level: curr,
                         sl,
@@ -394,6 +406,9 @@ pub struct RealtimeEngine {
     pub subscribers: RwLock<HashMap<i32, Subscriber>>,
     pub ws_sender: Mutex<Option<mpsc::UnboundedSender<WsCommand>>>,
     pub running: AtomicBool,
+    pub sl_percent: RwLock<f64>,
+    pub tp_percent: RwLock<f64>,
+    pub reverse_mode: RwLock<bool>,
 }
 
 impl RealtimeEngine {
@@ -403,7 +418,28 @@ impl RealtimeEngine {
             subscribers: RwLock::new(HashMap::new()),
             ws_sender: Mutex::new(None),
             running: AtomicBool::new(true),
+            sl_percent: RwLock::new(1.5),
+            tp_percent: RwLock::new(0.5),
+            reverse_mode: RwLock::new(false),
         })
+    }
+
+    pub fn set_config(&self, sl: f64, tp: f64) {
+        *self.sl_percent.write().unwrap() = sl;
+        *self.tp_percent.write().unwrap() = tp;
+        println!("[Config] SL={sl}% TP={tp}%");
+    }
+
+    pub fn set_reverse_mode(&self, enabled: bool) {
+        *self.reverse_mode.write().unwrap() = enabled;
+        println!("[Config] Reverse mode={enabled}");
+    }
+
+    pub fn get_config(&self) -> (f64, f64, bool) {
+        let sl = *self.sl_percent.read().unwrap();
+        let tp = *self.tp_percent.read().unwrap();
+        let rev = *self.reverse_mode.read().unwrap();
+        (sl, tp, rev)
     }
 
     pub fn add_tracker(self: &Arc<Self>, symbol: &str) -> bool {
@@ -557,6 +593,8 @@ impl RealtimeEngine {
 
         let topic = msg.get("topic").and_then(|t| t.as_str()).unwrap_or("");
 
+        let (sl_pct, tp_pct, reverse) = (*self.sl_percent.read().unwrap(), *self.tp_percent.read().unwrap(), *self.reverse_mode.read().unwrap());
+
         if let Some(sym) = topic.strip_prefix("kline.1.") {
             if data.get("confirm").and_then(|c| c.as_bool()) == Some(true) {
                 let kline = self.parse_kline(&data);
@@ -565,7 +603,7 @@ impl RealtimeEngine {
                         let mut trackers = self.trackers.write().unwrap();
                         trackers
                             .get_mut(sym)
-                            .map(|tr| tr.process_kline(&kl))
+                            .map(|tr| tr.process_kline(&kl, sl_pct, tp_pct, reverse))
                             .unwrap_or_default()
                     };
                     for ev in events {
@@ -602,7 +640,7 @@ impl RealtimeEngine {
                     let mut trackers = self.trackers.write().unwrap();
                     trackers
                         .get_mut(sym)
-                        .map(|tr| tr.update_ticker(b, a))
+                        .map(|tr| tr.update_ticker(b, a, sl_pct, tp_pct, reverse))
                         .unwrap_or_default()
                 };
                 for ev in events {
@@ -1023,6 +1061,9 @@ impl RealtimeEngine {
             closed_rows
         };
 
+        let (sl_pct, tp_pct, rev) = (*self.sl_percent.read().unwrap(), *self.tp_percent.read().unwrap(), *self.reverse_mode.read().unwrap());
+        let rev_tag = if rev { " <span style=\"color:#ef5350;font-weight:700\">[REVERSE]</span>" } else { "" };
+
         format!(
             r#"<!DOCTYPE html>
 <html lang="en">
@@ -1055,7 +1096,11 @@ impl RealtimeEngine {
 </style>
 </head>
 <body>
-<h1>Grid Trading Engine &mdash; 1:3 R:R, 0.5% Grid</h1>
+<h1>Grid Trading Engine{rev_tag}</h1>
+<p style="color:#8b949e;margin:4px 0 12px;font-size:0.9em">
+  Grid: 0.5% &middot; SL: {sl_pct}% &middot; TP: {tp_pct}%
+  &middot; <a href="/config">Config</a>
+</p>
 
 <div class="summary">
   <div class="summary-card"><div class="num">{active}</div><div class="lbl">Active</div></div>
@@ -1123,6 +1168,9 @@ impl RealtimeEngine {
             total_pnl_cls = pnl_class(summary.total_pnl),
             unrealized_pnl = summary.unrealized_pnl,
             upnl_cls = pnl_class(summary.unrealized_pnl),
+            rev_tag = rev_tag,
+            sl_pct = sl_pct,
+            tp_pct = tp_pct,
             combined = combined,
             combined_cls = pnl_class(combined),
             sub_cards = sub_cards,
@@ -1227,6 +1275,7 @@ impl RealtimeEngine {
 <div class="nav">
   <a href="/">Dashboard</a>
   <a href="/subs" class="active">Manage</a>
+  <a href="/config">Config</a>
   <a href="/state">State</a>
 </div>
 <h1>Manage Grid Engine</h1>
@@ -1427,6 +1476,10 @@ impl RealtimeEngine {
     }
 
     pub fn score_symbol_grid(klines: &[KlineData]) -> GridScore {
+        Self::score_symbol_grid_with_config(klines, 1.5, 0.5)
+    }
+
+    pub fn score_symbol_grid_with_config(klines: &[KlineData], sl_pct: f64, tp_pct: f64) -> GridScore {
         if klines.len() < 10 {
             return GridScore {
                 symbol: String::new(),
@@ -1533,17 +1586,15 @@ impl RealtimeEngine {
             // check entry (level crossed, only if no active trade)
             if active.is_none() && curr_level != prev_level {
                 if curr_level > prev_level {
-                    // short (mean reversion) — risk 1.5%, reward 0.5%
                     let entry = k.close;
-                    let sl = entry * 1.015;
-                    let tp = entry * 0.995;
+                    let sl = entry * (1.0 + sl_pct / 100.0);
+                    let tp = entry * (1.0 - tp_pct / 100.0);
                     active = Some((TradeDirection::Short, entry, sl, tp));
                     total_trades += 1;
                 } else {
-                    // long (mean reversion) — risk 1.5%, reward 0.5%
                     let entry = k.close;
-                    let sl = entry * 0.985;
-                    let tp = entry * 1.005;
+                    let sl = entry * (1.0 - sl_pct / 100.0);
+                    let tp = entry * (1.0 + tp_pct / 100.0);
                     active = Some((TradeDirection::Long, entry, sl, tp));
                     total_trades += 1;
                 }
