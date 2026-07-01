@@ -48,7 +48,7 @@ fn get_exchange(sub_id: i32) -> CachedExchange {
     ex
 }
 
-pub async fn fetch_ticker(symbol: &str) -> Result<f64, String> {
+pub async fn fetch_ticker(symbol: &str) -> Result<(f64, f64), String> {
     let url = format!("https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}");
     let resp = http_client()
         .get(&url)
@@ -59,12 +59,18 @@ pub async fn fetch_ticker(symbol: &str) -> Result<f64, String> {
     if val["retCode"].as_i64() != Some(0) {
         return Err(format!("ticker error: {val}"));
     }
-    let price = val["result"]["list"][0]["lastPrice"]
+    let list = &val["result"]["list"][0];
+    let bid = list["bid1Price"]
         .as_str()
-        .ok_or("no lastPrice")?
+        .ok_or("no bid1Price")?
         .parse::<f64>()
         .map_err(|e| e.to_string())?;
-    Ok(price)
+    let ask = list["ask1Price"]
+        .as_str()
+        .ok_or("no ask1Price")?
+        .parse::<f64>()
+        .map_err(|e| e.to_string())?;
+    Ok((bid, ask))
 }
 
 async fn private_post(

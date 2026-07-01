@@ -97,6 +97,8 @@ pub struct SymbolTracker {
     pub closed_trades: Vec<Trade>,
     pub active_trade: Option<Trade>,
     pub current_price: Option<f64>,
+    pub current_bid: Option<f64>,
+    pub current_ask: Option<f64>,
 }
 
 impl SymbolTracker {
@@ -112,6 +114,8 @@ impl SymbolTracker {
             closed_trades: Vec::new(),
             active_trade: None,
             current_price: None,
+            current_bid: None,
+            current_ask: None,
         }
     }
 
@@ -131,14 +135,20 @@ impl SymbolTracker {
         }
 
         if self.entry_price.is_none() {
-            self.entry_price = Some(close);
-            self.sl = Some(close * if self.direction == Side::Long { 0.995 } else { 1.005 });
+            let ask = self.current_ask.unwrap_or(close);
+            let bid = self.current_bid.unwrap_or(close);
+            let (entry, sl_val) = match self.direction {
+                Side::Long => (ask, ask * 0.995),
+                Side::Short => (bid, bid * 1.005),
+            };
+            self.entry_price = Some(entry);
+            self.sl = Some(sl_val);
             self.in_position = true;
             self.active_trade = Some(Trade {
                 symbol: self.symbol.clone(),
                 direction: self.direction,
                 entry_time: dt,
-                entry_price: close,
+                entry_price: entry,
                 exit_time: None,
                 exit_price: None,
                 status: TradeStatus::Open,
@@ -146,7 +156,7 @@ impl SymbolTracker {
             return TrackerEvent::Entered {
                 symbol: self.symbol.clone(),
                 direction: self.direction,
-                price: close,
+                price: entry,
             };
         }
 
@@ -158,6 +168,8 @@ impl SymbolTracker {
 
     fn process_long(&mut self, close: f64, low: f64, dt: DateTime<Utc>) -> TrackerEvent {
         let mut event = TrackerEvent::None;
+        let ask = self.current_ask.unwrap_or(close);
+        let bid = self.current_bid.unwrap_or(low);
 
         if !self.in_position && !self.waiting_for_reentry {
             self.in_position = true;
@@ -165,7 +177,7 @@ impl SymbolTracker {
                 symbol: self.symbol.clone(),
                 direction: Side::Long,
                 entry_time: dt,
-                entry_price: close,
+                entry_price: ask,
                 exit_time: None,
                 exit_price: None,
                 status: TradeStatus::Open,
@@ -173,18 +185,18 @@ impl SymbolTracker {
             event = TrackerEvent::Entered {
                 symbol: self.symbol.clone(),
                 direction: Side::Long,
-                price: close,
+                price: ask,
             };
         } else if !self.in_position && self.waiting_for_reentry {
             if let Some(ep) = self.entry_price {
-                if close > ep {
+                if ask > ep {
                     self.in_position = true;
                     self.waiting_for_reentry = false;
                     self.active_trade = Some(Trade {
                         symbol: self.symbol.clone(),
                         direction: Side::Long,
                         entry_time: dt,
-                        entry_price: close,
+                        entry_price: ask,
                         exit_time: None,
                         exit_price: None,
                         status: TradeStatus::Open,
@@ -192,7 +204,7 @@ impl SymbolTracker {
                     event = TrackerEvent::Entered {
                         symbol: self.symbol.clone(),
                         direction: Side::Long,
-                        price: close,
+                        price: ask,
                     };
                 }
             }
@@ -200,7 +212,7 @@ impl SymbolTracker {
 
         if self.in_position {
             if let Some(sl) = self.sl {
-                if low <= sl {
+                if bid <= sl {
                     self.in_position = false;
                     self.waiting_for_reentry = true;
                     if let Some(mut t) = self.active_trade.take() {
@@ -221,6 +233,8 @@ impl SymbolTracker {
 
     fn process_short(&mut self, close: f64, high: f64, dt: DateTime<Utc>) -> TrackerEvent {
         let mut event = TrackerEvent::None;
+        let ask = self.current_ask.unwrap_or(high);
+        let bid = self.current_bid.unwrap_or(close);
 
         if !self.in_position && !self.waiting_for_reentry {
             self.in_position = true;
@@ -228,7 +242,7 @@ impl SymbolTracker {
                 symbol: self.symbol.clone(),
                 direction: Side::Short,
                 entry_time: dt,
-                entry_price: close,
+                entry_price: bid,
                 exit_time: None,
                 exit_price: None,
                 status: TradeStatus::Open,
@@ -236,18 +250,18 @@ impl SymbolTracker {
             event = TrackerEvent::Entered {
                 symbol: self.symbol.clone(),
                 direction: Side::Short,
-                price: close,
+                price: bid,
             };
         } else if !self.in_position && self.waiting_for_reentry {
             if let Some(ep) = self.entry_price {
-                if close < ep {
+                if bid < ep {
                     self.in_position = true;
                     self.waiting_for_reentry = false;
                     self.active_trade = Some(Trade {
                         symbol: self.symbol.clone(),
                         direction: Side::Short,
                         entry_time: dt,
-                        entry_price: close,
+                        entry_price: bid,
                         exit_time: None,
                         exit_price: None,
                         status: TradeStatus::Open,
@@ -255,7 +269,7 @@ impl SymbolTracker {
                     event = TrackerEvent::Entered {
                         symbol: self.symbol.clone(),
                         direction: Side::Short,
-                        price: close,
+                        price: bid,
                     };
                 }
             }
@@ -263,7 +277,7 @@ impl SymbolTracker {
 
         if self.in_position {
             if let Some(sl) = self.sl {
-                if high >= sl {
+                if ask >= sl {
                     self.in_position = false;
                     self.waiting_for_reentry = true;
                     if let Some(mut t) = self.active_trade.take() {
@@ -282,20 +296,29 @@ impl SymbolTracker {
         event
     }
 
-    pub fn update_ticker(&mut self, price: f64) -> TrackerEvent {
-        self.current_price = Some(price);
+    pub fn update_ticker(&mut self, bid: f64, ask: f64) -> TrackerEvent {
+        self.current_bid = Some(bid);
+        self.current_ask = Some(ask);
+        self.current_price = Some(match self.direction {
+            Side::Long => bid,
+            Side::Short => ask,
+        });
         let mut event = TrackerEvent::None;
         let mut exited = false;
 
         if self.entry_price.is_none() {
-            self.entry_price = Some(price);
-            self.sl = Some(price * if self.direction == Side::Long { 0.995 } else { 1.005 });
+            let (entry, sl_val) = match self.direction {
+                Side::Long => (ask, ask * 0.995),
+                Side::Short => (bid, bid * 1.005),
+            };
+            self.entry_price = Some(entry);
+            self.sl = Some(sl_val);
             self.in_position = true;
             self.active_trade = Some(Trade {
                 symbol: self.symbol.clone(),
                 direction: self.direction,
                 entry_time: Utc::now(),
-                entry_price: price,
+                entry_price: entry,
                 exit_time: None,
                 exit_price: None,
                 status: TradeStatus::Open,
@@ -303,15 +326,15 @@ impl SymbolTracker {
             event = TrackerEvent::Entered {
                 symbol: self.symbol.clone(),
                 direction: self.direction,
-                price,
+                price: entry,
             };
         }
 
         if self.in_position {
             if let Some(sl) = self.sl {
                 let hit = match self.direction {
-                    Side::Long => price <= sl,
-                    Side::Short => price >= sl,
+                    Side::Long => bid <= sl,
+                    Side::Short => ask >= sl,
                 };
                 if hit {
                     self.in_position = false;
@@ -333,8 +356,8 @@ impl SymbolTracker {
         if !self.in_position && self.waiting_for_reentry && !exited {
             if let Some(ep) = self.entry_price {
                 let reenter = match self.direction {
-                    Side::Long => price > ep,
-                    Side::Short => price < ep,
+                    Side::Long => ask > ep,
+                    Side::Short => bid < ep,
                 };
                 if reenter {
                     self.in_position = true;
@@ -343,7 +366,10 @@ impl SymbolTracker {
                         symbol: self.symbol.clone(),
                         direction: self.direction,
                         entry_time: Utc::now(),
-                        entry_price: price,
+                        entry_price: match self.direction {
+                            Side::Long => ask,
+                            Side::Short => bid,
+                        },
                         exit_time: None,
                         exit_price: None,
                         status: TradeStatus::Open,
@@ -351,7 +377,10 @@ impl SymbolTracker {
                     event = TrackerEvent::Entered {
                         symbol: self.symbol.clone(),
                         direction: self.direction,
-                        price,
+                        price: match self.direction {
+                            Side::Long => ask,
+                            Side::Short => bid,
+                        },
                     };
                 }
             }
@@ -408,11 +437,11 @@ impl RealtimeEngine {
     pub fn add_tracker(self: &Arc<Self>, symbol: &str, direction: Side) -> bool {
         let symbol = symbol.to_uppercase();
 
-        let price = tokio::task::block_in_place(|| {
+        let (bid, ask) = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(trade_manager::fetch_ticker(&symbol))
                 .ok()
-        });
+        }).unwrap_or((0.0, 0.0));
 
         let now = Utc::now();
         let entered = {
@@ -423,16 +452,25 @@ impl RealtimeEngine {
                 }
             }
             let mut tr = SymbolTracker::new(symbol.clone(), direction);
-            let entered = if let Some(p) = price {
-                tr.entry_price = Some(p);
-                tr.sl = Some(p * if direction == Side::Long { 0.995 } else { 1.005 });
+            let entered = if bid > 0.0 && ask > 0.0 {
+                let (entry, sl_val) = match direction {
+                    Side::Long => (ask, ask * 0.995),
+                    Side::Short => (bid, bid * 1.005),
+                };
+                tr.entry_price = Some(entry);
+                tr.sl = Some(sl_val);
                 tr.in_position = true;
-                tr.current_price = Some(p);
+                tr.current_price = Some(match direction {
+                    Side::Long => bid,
+                    Side::Short => ask,
+                });
+                tr.current_bid = Some(bid);
+                tr.current_ask = Some(ask);
                 tr.active_trade = Some(Trade {
                     symbol: symbol.clone(),
                     direction,
                     entry_time: now,
-                    entry_price: p,
+                    entry_price: entry,
                     exit_time: None,
                     exit_price: None,
                     status: TradeStatus::Open,
@@ -440,10 +478,10 @@ impl RealtimeEngine {
                 tr.klines.push(KlineData {
                     ts: now.timestamp_millis(),
                     datetime: now,
-                    open: p,
-                    high: p,
-                    low: p,
-                    close: p,
+                    open: entry,
+                    high: entry,
+                    low: entry,
+                    close: entry,
                     volume: 0.0,
                 });
                 true
@@ -455,7 +493,11 @@ impl RealtimeEngine {
         };
 
         if entered {
-            self.on_enter_position(symbol.clone(), direction, price.unwrap());
+            let ep = match direction {
+                Side::Long => ask,
+                Side::Short => bid,
+            };
+            self.on_enter_position(symbol.clone(), direction, ep);
         }
 
         self.send_ws_cmd(WsCommand::Subscribe(symbol));
@@ -606,44 +648,44 @@ impl RealtimeEngine {
                 }
             }
         } else if let Some(sym) = topic.strip_prefix("tickers.") {
-            let price = data
-                .get("lastPrice")
+            let bid = data
+                .get("bid1Price")
                 .and_then(|v| v.as_str())
-                .and_then(|s| s.parse::<f64>().ok())
-                .or_else(|| {
-                    let bid = data
-                        .get("bid1Price")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<f64>().ok());
-                    let ask = data
-                        .get("ask1Price")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<f64>().ok());
-                    bid.zip(ask).map(|(b, a)| (b + a) / 2.0)
-                })
-                .or_else(|| {
-                    data.get("markPrice")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<f64>().ok())
-                });
+                .and_then(|s| s.parse::<f64>().ok());
+            let ask = data
+                .get("ask1Price")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok());
 
-            if let Some(p) = price {
-                let event = {
-                    let mut trackers = self.trackers.write().unwrap();
-                    trackers
-                        .get_mut(sym)
-                        .map(|tr| tr.update_ticker(p))
-                        .unwrap_or(TrackerEvent::None)
-                };
-                match event {
-                    TrackerEvent::Entered { symbol: s, direction: d, price } => {
-                        self.on_enter_position(s, d, price);
+            let (bid, ask) = match (bid, ask) {
+                (Some(b), Some(a)) => (b, a),
+                _ => {
+                    let mp = data
+                        .get("markPrice")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<f64>().ok());
+                    match mp {
+                        Some(p) => (p, p),
+                        None => return,
                     }
-                    TrackerEvent::Exited { symbol: s } => {
-                        self.on_exit_position(s);
-                    }
-                    TrackerEvent::None => {}
                 }
+            };
+
+            let event = {
+                let mut trackers = self.trackers.write().unwrap();
+                trackers
+                    .get_mut(sym)
+                    .map(|tr| tr.update_ticker(bid, ask))
+                    .unwrap_or(TrackerEvent::None)
+            };
+            match event {
+                TrackerEvent::Entered { symbol: s, direction: d, price } => {
+                    self.on_enter_position(s, d, price);
+                }
+                TrackerEvent::Exited { symbol: s } => {
+                    self.on_exit_position(s);
+                }
+                TrackerEvent::None => {}
             }
         }
     }
