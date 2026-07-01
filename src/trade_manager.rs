@@ -287,7 +287,7 @@ fn round_qty(qty: f64, step: f64) -> String {
     format!("{:.prec$}", rounded, prec = decimals)
 }
 
-pub fn open_long(symbol: String, position_size: f64, sub_id: i32) {
+pub fn open_long(symbol: String, qty: f64, sub_id: i32, limit_price: f64, sl: f64, tp: f64) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -296,31 +296,35 @@ pub fn open_long(symbol: String, position_size: f64, sub_id: i32) {
         rt.block_on(async move {
             let step = get_qty_step(&symbol).await;
             let ex = get_exchange(sub_id);
-            let qty = round_qty(position_size, step);
+            let qty_str = round_qty(qty, step);
             let sym = symbol.clone();
             let body = json!({
                 "category": "linear",
                 "symbol": sym,
                 "side": "Buy",
-                "orderType": "Market",
-                "qty": qty.clone(),
+                "orderType": "Limit",
+                "qty": qty_str.clone(),
+                "price": format!("{}", limit_price),
+                "takeProfit": format!("{}", tp),
+                "stopLoss": format!("{}", sl),
+                "tpslMode": "Full",
                 "positionIdx": 1,
-                "timeInForce": "IOC"
+                "timeInForce": "GTC"
             });
             match private_post(&ex.base_url, "/v5/order/create", body, &ex.api_key, &ex.secret).await {
                 Ok(v) => println!(
-                    "[TradeManager] LONG {symbol} {qty} subID={sub_id} order={}",
+                    "[TradeManager] LONG {symbol} qty={qty_str} limit={limit_price} SL={sl} TP={tp} subID={sub_id} order={}",
                     v["result"]["orderId"]
                 ),
                 Err(e) => println!(
-                    "[TradeManager] openLong({symbol}, {position_size}) failed: {e}"
+                    "[TradeManager] openLong({symbol}, limit={limit_price}) failed: {e}"
                 ),
             }
         });
     });
 }
 
-pub fn open_short(symbol: String, position_size: f64, sub_id: i32) {
+pub fn open_short(symbol: String, qty: f64, sub_id: i32, limit_price: f64, sl: f64, tp: f64) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -329,172 +333,100 @@ pub fn open_short(symbol: String, position_size: f64, sub_id: i32) {
         rt.block_on(async move {
             let step = get_qty_step(&symbol).await;
             let ex = get_exchange(sub_id);
-            let qty = round_qty(position_size, step);
+            let qty_str = round_qty(qty, step);
             let sym = symbol.clone();
             let body = json!({
                 "category": "linear",
                 "symbol": sym,
                 "side": "Sell",
-                "orderType": "Market",
-                "qty": qty.clone(),
+                "orderType": "Limit",
+                "qty": qty_str.clone(),
+                "price": format!("{}", limit_price),
+                "takeProfit": format!("{}", tp),
+                "stopLoss": format!("{}", sl),
+                "tpslMode": "Full",
                 "positionIdx": 2,
-                "timeInForce": "IOC"
+                "timeInForce": "GTC"
             });
             match private_post(&ex.base_url, "/v5/order/create", body, &ex.api_key, &ex.secret).await {
                 Ok(v) => println!(
-                    "[TradeManager] SHORT {symbol} {qty} subID={sub_id} order={}",
+                    "[TradeManager] SHORT {symbol} qty={qty_str} limit={limit_price} SL={sl} TP={tp} subID={sub_id} order={}",
                     v["result"]["orderId"]
                 ),
                 Err(e) => println!(
-                    "[TradeManager] openShort({symbol}, {position_size}) failed: {e}"
+                    "[TradeManager] openShort({symbol}, limit={limit_price}) failed: {e}"
                 ),
             }
         });
     });
 }
 
-pub fn close_long(symbol: String, sub_id: i32) {
+pub fn cancel_old_orders(symbol: String, sub_id: i32) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async move {
-            let step = get_qty_step(&symbol).await;
             let ex = get_exchange(sub_id);
             let sym = &symbol;
 
-            let _ = private_post(
-                &ex.base_url,
-                "/v5/order/cancel-all",
-                json!({"category": "linear", "symbol": sym}),
-                &ex.api_key,
-                &ex.secret,
-            )
-            .await;
-
             match private_get(
                 &ex.base_url,
-                "/v5/position/list",
-                &[("category", "linear"), ("symbol", sym)],
+                "/v5/order/realtime",
+                &[("category", "linear"), ("symbol", sym), ("limit", "50")],
                 &ex.api_key,
                 &ex.secret,
             )
             .await
             {
-                Ok(pos_resp) => {
-                    if let Some(list) = pos_resp["result"]["list"].as_array() {
-                        for pos in list {
-                            if pos["side"].as_str() != Some("Buy") {
+                Ok(resp) => {
+                    let now = Utc::now();
+                    let cutoff = now - chrono::Duration::minutes(3);
+                    if let Some(list) = resp["result"]["list"].as_array() {
+                        for order in list {
+                            let stop_type = order["stopOrderType"].as_str().unwrap_or("");
+                            if !stop_type.is_empty() {
+                                continue; // skip TP/SL orders
+                            }
+                            let status = order["orderStatus"].as_str().unwrap_or("");
+                            if status != "New" && status != "PartiallyFilled" && status != "Untriggered" {
                                 continue;
                             }
-                            let size = pos["size"]
+                            let created_str = order["createdTime"]
                                 .as_str()
-                                .unwrap_or("0")
-                                .parse::<f64>()
-                                .unwrap_or(0.0);
-                            if size <= 0.0 {
+                                .unwrap_or("0");
+                            let created_ms: i64 = created_str.parse().unwrap_or(0);
+                            let created = DateTime::from_timestamp_millis(created_ms)
+                                .unwrap_or(DateTime::from_timestamp(0, 0).unwrap());
+                            if created > cutoff {
                                 continue;
                             }
-                            let sym_name = pos["symbol"].as_str().unwrap_or("").to_string();
-                            let body = json!({
-                                "category": "linear",
-                                "symbol": &sym_name,
-                                "side": "Sell",
-                                "orderType": "Market",
-                                "qty": round_qty(size, step),
-                                "positionIdx": 1,
-                                "timeInForce": "IOC",
-                                "reduceOnly": true,
-                            });
-                            let _ = private_post(
+                            let oid = order["orderId"].as_str().unwrap_or("");
+                            if oid.is_empty() {
+                                continue;
+                            }
+                            match private_post(
                                 &ex.base_url,
-                                "/v5/order/create",
-                                body,
+                                "/v5/order/cancel",
+                                json!({"category": "linear", "symbol": sym, "orderId": oid}),
                                 &ex.api_key,
                                 &ex.secret,
                             )
-                            .await;
-                            println!("[TradeManager] Close LONG {sym_name} {size} subID={sub_id}");
+                            .await
+                            {
+                                Ok(_) => println!(
+                                    "[TradeManager] Cancelled stale order {oid} {sym} subID={sub_id}"
+                                ),
+                                Err(e) => println!(
+                                    "[TradeManager] Cancel {oid} failed: {e}"
+                                ),
+                            }
                         }
                     }
                 }
                 Err(e) => println!(
-                    "[TradeManager] closeLong({sub_id}) failed: {e}"
-                ),
-            }
-        });
-    });
-}
-
-pub fn close_short(symbol: String, sub_id: i32) {
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let step = get_qty_step(&symbol).await;
-            let ex = get_exchange(sub_id);
-            let sym = &symbol;
-
-            let _ = private_post(
-                &ex.base_url,
-                "/v5/order/cancel-all",
-                json!({"category": "linear", "symbol": sym}),
-                &ex.api_key,
-                &ex.secret,
-            )
-            .await;
-
-            match private_get(
-                &ex.base_url,
-                "/v5/position/list",
-                &[("category", "linear"), ("symbol", sym)],
-                &ex.api_key,
-                &ex.secret,
-            )
-            .await
-            {
-                Ok(pos_resp) => {
-                    if let Some(list) = pos_resp["result"]["list"].as_array() {
-                        for pos in list {
-                            if pos["side"].as_str() != Some("Sell") {
-                                continue;
-                            }
-                            let size = pos["size"]
-                                .as_str()
-                                .unwrap_or("0")
-                                .parse::<f64>()
-                                .unwrap_or(0.0);
-                            if size <= 0.0 {
-                                continue;
-                            }
-                            let sym_name = pos["symbol"].as_str().unwrap_or("").to_string();
-                            let body = json!({
-                                "category": "linear",
-                                "symbol": &sym_name,
-                                "side": "Buy",
-                                "orderType": "Market",
-                                "qty": round_qty(size, step),
-                                "positionIdx": 2,
-                                "timeInForce": "IOC",
-                                "reduceOnly": true,
-                            });
-                            let _ = private_post(
-                                &ex.base_url,
-                                "/v5/order/create",
-                                body,
-                                &ex.api_key,
-                                &ex.secret,
-                            )
-                            .await;
-                            println!("[TradeManager] Close SHORT {sym_name} {size} subID={sub_id}");
-                        }
-                    }
-                }
-                Err(e) => println!(
-                    "[TradeManager] closeShort({sub_id}) failed: {e}"
+                    "[TradeManager] cancelOldOrders({sub_id}) failed: {e}"
                 ),
             }
         });

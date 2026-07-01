@@ -218,6 +218,8 @@ impl SymbolTracker {
                     direction: TradeDirection::Short,
                     price: entry_price,
                     level: curr_level,
+                    sl,
+                    tp,
                 });
             } else {
                 // price moved down → enter LONG (mean reversion)
@@ -241,6 +243,8 @@ impl SymbolTracker {
                     direction: TradeDirection::Long,
                     price: entry_price,
                     level: curr_level,
+                    sl,
+                    tp,
                 });
             }
         }
@@ -316,6 +320,8 @@ impl SymbolTracker {
                         direction: TradeDirection::Short,
                         price: entry_price,
                         level: curr,
+                        sl,
+                        tp,
                     });
                     self.last_close_level = Some(curr);
                 } else if curr < prev {
@@ -340,6 +346,8 @@ impl SymbolTracker {
                         direction: TradeDirection::Long,
                         price: entry_price,
                         level: curr,
+                        sl,
+                        tp,
                     });
                     self.last_close_level = Some(curr);
                 }
@@ -361,6 +369,8 @@ pub enum TrackerEvent {
         direction: TradeDirection,
         price: f64,
         level: i32,
+        sl: f64,
+        tp: f64,
     },
     Exited {
         symbol: String,
@@ -471,6 +481,8 @@ impl RealtimeEngine {
         symbol: String,
         direction: TradeDirection,
         price: f64,
+        sl: f64,
+        tp: f64,
     ) {
         let subs = {
             let subs = self.subscribers.read().unwrap();
@@ -481,13 +493,13 @@ impl RealtimeEngine {
             let sym = symbol.clone();
             let sid = sub.sub_id;
             match direction {
-                TradeDirection::Long => trade_manager::open_long(sym, qty, sid),
-                TradeDirection::Short => trade_manager::open_short(sym, qty, sid),
+                TradeDirection::Long => trade_manager::open_long(sym, qty, sid, price, sl, tp),
+                TradeDirection::Short => trade_manager::open_short(sym, qty, sid, price, sl, tp),
             }
         }
     }
 
-    fn on_exit_position(self: &Arc<Self>, symbol: String, direction: TradeDirection) {
+    fn on_exit_position(self: &Arc<Self>, symbol: String, _direction: TradeDirection) {
         let subs = {
             let subs = self.subscribers.read().unwrap();
             subs.values().cloned().collect::<Vec<_>>()
@@ -495,10 +507,7 @@ impl RealtimeEngine {
         for sub in subs {
             let sym = symbol.clone();
             let sid = sub.sub_id;
-            match direction {
-                TradeDirection::Long => trade_manager::close_long(sym, sid),
-                TradeDirection::Short => trade_manager::close_short(sym, sid),
-            }
+            trade_manager::cancel_old_orders(sym, sid);
         }
     }
 
@@ -565,9 +574,11 @@ impl RealtimeEngine {
                                 symbol: s,
                                 direction: d,
                                 price,
+                                sl,
+                                tp,
                                 ..
                             } => {
-                                self.on_enter_position(s, d, price);
+                                self.on_enter_position(s, d, price, sl, tp);
                             }
                             TrackerEvent::Exited { symbol: s, direction: d, .. } => {
                                 self.on_exit_position(s, d);
@@ -600,9 +611,11 @@ impl RealtimeEngine {
                             symbol: s,
                             direction: d,
                             price,
+                            sl,
+                            tp,
                             ..
                         } => {
-                            self.on_enter_position(s, d, price);
+                            self.on_enter_position(s, d, price, sl, tp);
                         }
                         TrackerEvent::Exited { symbol: s, direction: d, .. } => {
                             self.on_exit_position(s, d);
