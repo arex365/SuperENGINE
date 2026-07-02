@@ -556,6 +556,7 @@ impl RealtimeEngine {
 
         let data = match msg.get("data") {
             Some(Value::Object(_)) => msg["data"].clone(),
+            Some(Value::Array(arr)) if !arr.is_empty() => arr[0].clone(),
             _ => return,
         };
 

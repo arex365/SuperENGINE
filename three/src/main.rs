@@ -404,7 +404,7 @@ async fn main() {
         .route("/ping", get(ping))
         .with_state(app_state);
 
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("0.0.0.0:{port}");
     println!("Starting Grid Trading Engine on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
