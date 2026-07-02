@@ -265,7 +265,6 @@ async fn config_page(State(state): State<Arc<AppState>>) -> Html<String> {
   <h3>Reverse Mode</h3>
   <p style="color:#8b949e;font-size:0.85em;margin-bottom:12px">
     When enabled, entry direction is inverted: a long signal becomes short and vice versa.
-    Bid/ask prices swap accordingly (long buys at ask, short sells at bid).
   </p>
   <div class="toggle">
     <form action="/setReverse" method="get">
@@ -335,16 +334,15 @@ async fn ping(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let mut data = serde_json::Map::new();
     for (sym, tr) in &trackers {
         let mut m = serde_json::Map::new();
-        m.insert("base_price".to_string(), json!(tr.base_price));
         m.insert("current_price".to_string(), json!(tr.current_price));
         m.insert(
             "in_position".to_string(),
-            json!(tr.active_trade.is_some()),
+            json!(!tr.active_trades.is_empty()),
         );
+        m.insert("active_trades".to_string(), json!(tr.active_trades.len()));
         m.insert("klines".to_string(), json!(tr.klines.len()));
         m.insert("closed_trades".to_string(), json!(tr.closed_trades.len()));
-        if let Some(ref t) = tr.active_trade {
-            m.insert("active_level".to_string(), json!(t.level));
+        if let Some(t) = tr.active_trades.first() {
             m.insert("direction".to_string(), json!(t.direction.as_str()));
             m.insert("entry_price".to_string(), json!(t.entry_price));
             m.insert("sl".to_string(), json!(t.sl));

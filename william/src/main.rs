@@ -158,7 +158,10 @@ async fn get_recommended_coins(State(state): State<Arc<AppState>>) -> impl IntoR
     // filter to top 100 by volume (approximate — the ticker list is already sorted)
     let candidates: Vec<String> = symbols.into_iter().take(100).collect();
 
-    let (sl_pct, tp_pct, _, _) = state.engine.get_config();
+    let (sl_pct, tp_pct, _, _, interval) = state.engine.get_config();
+
+    // maintain a ~48h time window regardless of interval
+    let limit = (2880 / interval).min(1000).max(50);
 
     let mut handles = Vec::new();
     let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
@@ -168,22 +171,21 @@ async fn get_recommended_coins(State(state): State<Arc<AppState>>) -> impl IntoR
         let sym_clone = sym.clone();
         let handle = tokio::spawn(async move {
             let _permit = permit;
-            let mut score = engine::GridScore {
+            let mut score = engine::AlligatorScore {
                 symbol: sym_clone.clone(),
                 base_price: 0.0,
-                price_range_pct: 0.0,
-                level_crosses: 0,
-                oscillation_score: 0.0,
+                total_signals: 0,
                 total_trades: 0,
                 wins: 0,
                 losses: 0,
                 total_pnl_pct: 0.0,
                 win_rate: 0.0,
+                max_drawdown_pct: 0.0,
                 suitability: 0.0,
             };
-            match trade_manager::fetch_historical_klines(&sym_clone, 5, 576).await {
+            match trade_manager::fetch_historical_klines(&sym_clone, interval as u32, limit as u32).await {
                 Ok(klines) if klines.len() >= 50 => {
-                    score = engine::RealtimeEngine::score_symbol_grid_with_config(&klines, sl_pct, tp_pct);
+                    score = engine::RealtimeEngine::score_symbol_with_config(&klines, sl_pct, tp_pct);
                     score.symbol = sym_clone;
                 }
                 _ => {}
@@ -206,12 +208,26 @@ async fn get_recommended_coins(State(state): State<Arc<AppState>>) -> impl IntoR
 
     Json(json!(results)).into_response()
 }
+async fn set_interval_route(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let interval: i32 = params
+        .get("interval")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1)
+        .min(1440);
+    state.engine.set_interval(interval);
+    Html(state.engine.generate_dashboard())
+}
+
 async fn config_page(State(state): State<Arc<AppState>>) -> Html<String> {
-    let (sl, tp, rev, ghost) = state.engine.get_config();
+    let (sl, tp, rev, ghost, interval) = state.engine.get_config();
     let html = format!(
         r#"<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><title>Config — Grid Engine</title>
+<head><meta charset="UTF-8"><title>Config — 🐊 Alligator Engine</title>
 <style>
   * {{ box-sizing:border-box; margin:0; padding:0 }}
   body {{ font-family:Segoe UI,sans-serif; background:#0d1117; color:#c9d1d9; padding:30px; max-width:700px; margin:0 auto }}
@@ -246,10 +262,33 @@ async fn config_page(State(state): State<Arc<AppState>>) -> Html<String> {
 <h1>Engine Configuration</h1>
 
 <div class="current">
+  <div class="row"><span>Kline Interval</span><span class="val">{interval}m</span></div>
   <div class="row"><span>Stop Loss</span><span class="val">{sl}%</span></div>
   <div class="row"><span>Take Profit</span><span class="val">{tp}%</span></div>
   <div class="row"><span>Reverse Mode</span><span class="val">{rev}</span></div>
   <div class="row"><span>Ghost Trades</span><span class="val">{ghost}</span></div>
+</div>
+
+<div class="card">
+  <h3>Kline Interval</h3>
+  <p style="color:#8b949e;font-size:0.85em;margin-bottom:12px">
+    Sets the timeframe for Williams Alligator calculation. Changing this will
+    resubscribe to WS streams with the new interval. Alligator needs ~21 bars
+    of data before generating signals (13 jaw + 8 displacement).
+  </p>
+  <form action="/setInterval" method="get">
+    <label>Minutes:</label>
+    <select name="interval" style="padding:8px 12px;border-radius:6px;border:1px solid #30363d;background:#21262d;color:#c9d1d9;font-size:0.95em" onchange="this.form.submit()">
+      <option value="1" {sel_1}>1m</option>
+      <option value="3" {sel_3}>3m</option>
+      <option value="5" {sel_5}>5m</option>
+      <option value="15" {sel_15}>15m</option>
+      <option value="30" {sel_30}>30m</option>
+      <option value="60" {sel_60}>1h</option>
+      <option value="120" {sel_120}>2h</option>
+      <option value="240" {sel_240}>4h</option>
+    </select>
+  </form>
 </div>
 
 <div class="card">
@@ -292,6 +331,15 @@ async fn config_page(State(state): State<Arc<AppState>>) -> Html<String> {
 </body></html>"#,
         sl = sl,
         tp = tp,
+        interval = interval,
+        sel_1 = if interval == 1 { "selected" } else { "" },
+        sel_3 = if interval == 3 { "selected" } else { "" },
+        sel_5 = if interval == 5 { "selected" } else { "" },
+        sel_15 = if interval == 15 { "selected" } else { "" },
+        sel_30 = if interval == 30 { "selected" } else { "" },
+        sel_60 = if interval == 60 { "selected" } else { "" },
+        sel_120 = if interval == 120 { "selected" } else { "" },
+        sel_240 = if interval == 240 { "selected" } else { "" },
         rev = if rev { "ON" } else { "OFF" },
         toggle_to = if rev { "false" } else { "true" },
         btn_cls = if rev { "btn-red" } else { "btn-green" },
@@ -343,8 +391,8 @@ async fn ping(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
         );
         m.insert("klines".to_string(), json!(tr.klines.len()));
         m.insert("closed_trades".to_string(), json!(tr.closed_trades.len()));
+        m.insert("alignment".to_string(), json!(tr.alignment.as_str()));
         if let Some(ref t) = tr.active_trade {
-            m.insert("active_level".to_string(), json!(t.level));
             m.insert("direction".to_string(), json!(t.direction.as_str()));
             m.insert("entry_price".to_string(), json!(t.entry_price));
             m.insert("sl".to_string(), json!(t.sl));
@@ -402,12 +450,14 @@ async fn main() {
         .route("/setReverse/", get(set_reverse_route))
         .route("/setGhost", get(set_ghost_route))
         .route("/setGhost/", get(set_ghost_route))
+        .route("/setInterval", get(set_interval_route))
+        .route("/setInterval/", get(set_interval_route))
         .route("/getRecommendedCoins", get(get_recommended_coins))
         .route("/ping", get(ping))
         .with_state(app_state);
 
     let addr = format!("127.0.0.1:{port}");
-    println!("Starting Grid Trading Engine on http://{addr}");
+    println!("Starting 🐊 Alligator Trading Engine on http://{addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

@@ -49,9 +49,8 @@ pub struct Subscriber {
 }
 
 #[derive(Debug, Clone)]
-pub struct GridTrade {
+pub struct Trade {
     pub symbol: String,
-    pub level: i32,
     pub direction: TradeDirection,
     pub entry_time: DateTime<Utc>,
     pub entry_price: f64,
@@ -69,7 +68,7 @@ pub enum TradeStatus {
     Closed,
 }
 
-impl GridTrade {
+impl Trade {
     fn pnl_pct(&self) -> f64 {
         if self.is_ghost || self.status == TradeStatus::Open || self.exit_price.is_none() {
             return 0.0;
@@ -106,44 +105,30 @@ pub struct GridScore {
 #[derive(Clone)]
 pub struct SymbolTracker {
     pub symbol: String,
-    pub base_price: f64,
-    pub level_step: f64,
-    pub last_close_level: Option<i32>,
     pub klines: Vec<KlineData>,
     pub current_price: Option<f64>,
-    pub active_trade: Option<GridTrade>,
-    pub closed_trades: Vec<GridTrade>,
+    pub active_trades: Vec<Trade>,
+    pub closed_trades: Vec<Trade>,
     pub ghost_remaining: i32,
     pub ghost_triggered: bool,
 }
 
 impl SymbolTracker {
-    pub fn new(symbol: String, base_price: f64) -> Self {
+    pub fn new(symbol: String) -> Self {
         SymbolTracker {
             symbol,
-            base_price,
-            level_step: base_price * 0.005,
-            last_close_level: None,
             klines: Vec::new(),
-            current_price: Some(base_price),
-            active_trade: None,
+            current_price: None,
+            active_trades: Vec::new(),
             closed_trades: Vec::new(),
             ghost_remaining: 0,
             ghost_triggered: false,
         }
     }
 
-    fn level_to_price(&self, level: i32) -> f64 {
-        self.base_price * (1.0 + level as f64 * 0.005)
-    }
-
-    fn price_to_level(&self, price: f64) -> i32 {
-        ((price / self.base_price - 1.0) / 0.005).round() as i32
-    }
-
     pub fn total_attempts(&self) -> usize {
         let closed = self.closed_trades.iter().filter(|t| !t.is_ghost).count();
-        let active = self.active_trade.as_ref().map(|t| if t.is_ghost { 0 } else { 1 }).unwrap_or(0);
+        let active = self.active_trades.iter().filter(|t| !t.is_ghost).count();
         closed + active
     }
 
@@ -161,40 +146,35 @@ impl SymbolTracker {
 
         let mut events = Vec::new();
 
-        let curr_level = self.price_to_level(close);
-        let prev_level = self.last_close_level.unwrap_or(curr_level);
-        self.last_close_level = Some(curr_level);
-
-        // ── Check exit (SL / TP) ──────────────────────────────────
-        if let Some(ref trade) = self.active_trade {
-            let (should_exit, exit_price) = match trade.direction {
+        // ── Check exit (SL / TP) for all active trades ────────────
+        let mut i = self.active_trades.len();
+        while i > 0 {
+            i -= 1;
+            let (should_exit, exit_price) = match self.active_trades[i].direction {
                 TradeDirection::Long => {
-                    if low <= trade.sl {
-                        (true, low) // SL fill at worst price (low breached)
-                    } else if high >= trade.tp {
-                        (true, trade.tp) // TP limit fills at target
+                    if low <= self.active_trades[i].sl {
+                        (true, low)
+                    } else if high >= self.active_trades[i].tp {
+                        (true, self.active_trades[i].tp)
                     } else {
                         (false, 0.0)
                     }
                 }
                 TradeDirection::Short => {
-                    if high >= trade.sl {
-                        (true, high) // SL fill at worst price (high breached)
-                    } else if low <= trade.tp {
-                        (true, trade.tp) // TP limit fills at target
+                    if high >= self.active_trades[i].sl {
+                        (true, high)
+                    } else if low <= self.active_trades[i].tp {
+                        (true, self.active_trades[i].tp)
                     } else {
                         (false, 0.0)
                     }
                 }
             };
             if should_exit {
-                let mut t = self.active_trade.take().unwrap();
+                let mut t = self.active_trades.remove(i);
                 t.exit_time = Some(dt);
                 t.exit_price = Some(exit_price);
                 t.status = TradeStatus::Closed;
-                // Ghost mode: after a real loss, next 3 trades are ghosts.
-                // Only triggers once per cycle — subsequent losses won't re-trigger
-                // until a win resets it.
                 if !t.is_ghost {
                     let was_loss = match t.direction {
                         TradeDirection::Long => exit_price < t.entry_price,
@@ -212,103 +192,103 @@ impl SymbolTracker {
                 events.push(TrackerEvent::Exited {
                     symbol: self.symbol.clone(),
                     direction: t.direction,
-                    level: t.level,
                     is_ghost: t.is_ghost,
                 });
             }
         }
 
-        // ── Check entry (level crossing, at most 1 active trade) ──
-        if self.active_trade.is_none() && curr_level != prev_level {
-            let is_ghost = self.ghost_remaining > 0;
-            if is_ghost {
-                self.ghost_remaining -= 1;
+        // ── Check entry (4-candle pattern on 15-min) ──────────────
+        if self.klines.len() >= 4 {
+            let last_4 = &self.klines[self.klines.len() - 4..];
+            let is_green = |k: &KlineData| k.close >= k.open;
+
+            // LONG: red → green → green → green
+            let long_signal = !is_green(&last_4[0]) && is_green(&last_4[1]) && is_green(&last_4[2]) && is_green(&last_4[3]);
+            // SHORT: green → red → red → red
+            let short_signal = is_green(&last_4[0]) && !is_green(&last_4[1]) && !is_green(&last_4[2]) && !is_green(&last_4[3]);
+
+            if long_signal || short_signal {
+                let signal_dir = if long_signal { TradeDirection::Long } else { TradeDirection::Short };
+                let direction = if reverse {
+                    match signal_dir {
+                        TradeDirection::Long => TradeDirection::Short,
+                        TradeDirection::Short => TradeDirection::Long,
+                    }
+                } else {
+                    signal_dir
+                };
+                let entry_price = close;
+                let is_ghost = self.ghost_remaining > 0;
+                if is_ghost {
+                    self.ghost_remaining -= 1;
+                }
+                let (sl, tp) = match direction {
+                    TradeDirection::Long => {
+                        (entry_price * (1.0 - sl_pct / 100.0), entry_price * (1.0 + tp_pct / 100.0))
+                    }
+                    TradeDirection::Short => {
+                        (entry_price * (1.0 + sl_pct / 100.0), entry_price * (1.0 - tp_pct / 100.0))
+                    }
+                };
+                self.active_trades.push(Trade {
+                    symbol: self.symbol.clone(),
+                    direction,
+                    entry_time: dt,
+                    entry_price,
+                    sl,
+                    tp,
+                    exit_time: None,
+                    exit_price: None,
+                    status: TradeStatus::Open,
+                    is_ghost,
+                });
+                events.push(TrackerEvent::Entered {
+                    symbol: self.symbol.clone(),
+                    direction,
+                    price: entry_price,
+                    sl,
+                    tp,
+                    is_ghost,
+                });
             }
-            let (direction, entry_price) = if curr_level > prev_level {
-                // price moved up → enter SHORT (mean reversion), or LONG if reversed
-                if reverse {
-                    (TradeDirection::Long, close)
-                } else {
-                    (TradeDirection::Short, close)
-                }
-            } else {
-                // price moved down → enter LONG (mean reversion), or SHORT if reversed
-                if reverse {
-                    (TradeDirection::Short, close)
-                } else {
-                    (TradeDirection::Long, close)
-                }
-            };
-            let (sl, tp) = match direction {
-                TradeDirection::Long => {
-                    (entry_price * (1.0 - sl_pct / 100.0), entry_price * (1.0 + tp_pct / 100.0))
-                }
-                TradeDirection::Short => {
-                    (entry_price * (1.0 + sl_pct / 100.0), entry_price * (1.0 - tp_pct / 100.0))
-                }
-            };
-            self.active_trade = Some(GridTrade {
-                symbol: self.symbol.clone(),
-                level: curr_level,
-                direction,
-                entry_time: dt,
-                entry_price,
-                sl,
-                tp,
-                exit_time: None,
-                exit_price: None,
-                status: TradeStatus::Open,
-                is_ghost,
-            });
-            events.push(TrackerEvent::Entered {
-                symbol: self.symbol.clone(),
-                direction,
-                price: entry_price,
-                level: curr_level,
-                sl,
-                tp,
-                is_ghost,
-            });
         }
 
         events
     }
 
-    pub fn update_ticker(&mut self, bid: f64, ask: f64, sl_pct: f64, tp_pct: f64, reverse: bool, ghost_threshold: i32) -> Vec<TrackerEvent> {
-        self.current_price = Some((bid + ask) / 2.0); // mid for display
+    pub fn update_ticker(&mut self, bid: f64, ask: f64, _sl_pct: f64, _tp_pct: f64, ghost_threshold: i32) -> Vec<TrackerEvent> {
+        self.current_price = Some((bid + ask) / 2.0);
         let mut events = Vec::new();
 
-        if let Some(ref trade) = self.active_trade {
-            let (should_exit, exit_price) = match trade.direction {
+        // ── Check exit (SL / TP) for all active trades ────────────
+        let mut i = self.active_trades.len();
+        while i > 0 {
+            i -= 1;
+            let (should_exit, exit_price) = match self.active_trades[i].direction {
                 TradeDirection::Long => {
-                    // LONG sells at bid
-                    if bid <= trade.sl {
+                    if bid <= self.active_trades[i].sl {
                         (true, bid)
-                    } else if bid >= trade.tp {
-                        (true, trade.tp)
+                    } else if bid >= self.active_trades[i].tp {
+                        (true, self.active_trades[i].tp)
                     } else {
                         (false, 0.0)
                     }
                 }
                 TradeDirection::Short => {
-                    // SHORT buys back at ask
-                    if ask >= trade.sl {
+                    if ask >= self.active_trades[i].sl {
                         (true, ask)
-                    } else if ask <= trade.tp {
-                        (true, trade.tp)
+                    } else if ask <= self.active_trades[i].tp {
+                        (true, self.active_trades[i].tp)
                     } else {
                         (false, 0.0)
                     }
                 }
             };
             if should_exit {
-                let mut t = self.active_trade.take().unwrap();
+                let mut t = self.active_trades.remove(i);
                 t.exit_time = Some(Utc::now());
                 t.exit_price = Some(exit_price);
                 t.status = TradeStatus::Closed;
-                // Ghost mode: after a real loss, next 3 trades are ghosts.
-                // Only triggers once per cycle — subsequent losses won't re-trigger
-                // until a win resets it.
                 if !t.is_ghost {
                     let was_loss = match t.direction {
                         TradeDirection::Long => exit_price < t.entry_price,
@@ -326,105 +306,8 @@ impl SymbolTracker {
                 events.push(TrackerEvent::Exited {
                     symbol: self.symbol.clone(),
                     direction: t.direction,
-                    level: t.level,
                     is_ghost: t.is_ghost,
                 });
-            }
-        }
-
-        // Entry on ticker (no active trade + direction from level change)
-        if self.active_trade.is_none() {
-            let mid = (bid + ask) / 2.0;
-            let mid = (bid + ask) / 2.0;
-            let curr = self.price_to_level(mid);
-            if let Some(prev) = self.last_close_level {
-                if curr > prev {
-                    // price moved up → SHORT (sell at bid), or LONG if reversed
-                    let (direction, entry_price) = if reverse {
-                        (TradeDirection::Long, ask)
-                    } else {
-                        (TradeDirection::Short, bid)
-                    };
-                    let (sl, tp) = match direction {
-                        TradeDirection::Long => {
-                            (entry_price * (1.0 - sl_pct / 100.0), entry_price * (1.0 + tp_pct / 100.0))
-                        }
-                        TradeDirection::Short => {
-                            (entry_price * (1.0 + sl_pct / 100.0), entry_price * (1.0 - tp_pct / 100.0))
-                        }
-                    };
-                    let is_ghost = self.ghost_remaining > 0;
-                    if is_ghost {
-                        self.ghost_remaining -= 1;
-                    }
-                    self.active_trade = Some(GridTrade {
-                        symbol: self.symbol.clone(),
-                        level: curr,
-                        direction,
-                        entry_time: Utc::now(),
-                        entry_price,
-                        sl,
-                        tp,
-                        exit_time: None,
-                        exit_price: None,
-                        status: TradeStatus::Open,
-                        is_ghost,
-                    });
-                    events.push(TrackerEvent::Entered {
-                        symbol: self.symbol.clone(),
-                        direction,
-                        price: entry_price,
-                        level: curr,
-                        sl,
-                        tp,
-                        is_ghost,
-                    });
-                    self.last_close_level = Some(curr);
-                } else if curr < prev {
-                    // price moved down → LONG (buy at ask), or SHORT if reversed
-                    let (direction, entry_price) = if reverse {
-                        (TradeDirection::Short, bid)
-                    } else {
-                        (TradeDirection::Long, ask)
-                    };
-                    let (sl, tp) = match direction {
-                        TradeDirection::Long => {
-                            (entry_price * (1.0 - sl_pct / 100.0), entry_price * (1.0 + tp_pct / 100.0))
-                        }
-                        TradeDirection::Short => {
-                            (entry_price * (1.0 + sl_pct / 100.0), entry_price * (1.0 - tp_pct / 100.0))
-                        }
-                    };
-                    let is_ghost = self.ghost_remaining > 0;
-                    if is_ghost {
-                        self.ghost_remaining -= 1;
-                    }
-                    self.active_trade = Some(GridTrade {
-                        symbol: self.symbol.clone(),
-                        level: curr,
-                        direction,
-                        entry_time: Utc::now(),
-                        entry_price,
-                        sl,
-                        tp,
-                        exit_time: None,
-                        exit_price: None,
-                        status: TradeStatus::Open,
-                        is_ghost,
-                    });
-                    events.push(TrackerEvent::Entered {
-                        symbol: self.symbol.clone(),
-                        direction,
-                        price: entry_price,
-                        level: curr,
-                        sl,
-                        tp,
-                        is_ghost,
-                    });
-                    self.last_close_level = Some(curr);
-                }
-            } else {
-                self.last_close_level = Some(curr);
             }
         }
 
@@ -440,7 +323,6 @@ pub enum TrackerEvent {
         symbol: String,
         direction: TradeDirection,
         price: f64,
-        level: i32,
         sl: f64,
         tp: f64,
         is_ghost: bool,
@@ -448,7 +330,6 @@ pub enum TrackerEvent {
     Exited {
         symbol: String,
         direction: TradeDirection,
-        level: i32,
         is_ghost: bool,
     },
 }
@@ -515,13 +396,13 @@ impl RealtimeEngine {
     pub fn add_tracker(self: &Arc<Self>, symbol: &str) -> bool {
         let symbol = symbol.to_uppercase();
 
-        let price = tokio::task::block_in_place(|| {
+        // verify symbol exists
+        let _price = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current()
                 .block_on(trade_manager::fetch_ticker(&symbol))
                 .ok()
         });
-
-        let price = match price {
+        let _price = match _price {
             Some(p) if p > 0.0 => p,
             _ => return false,
         };
@@ -531,7 +412,16 @@ impl RealtimeEngine {
             if trackers.contains_key(&symbol) {
                 return false;
             }
-            let tr = SymbolTracker::new(symbol.clone(), price);
+            let mut tr = SymbolTracker::new(symbol.clone());
+            // backfill 15-min klines for pattern detection
+            let klines = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(trade_manager::fetch_historical_klines(&symbol, 15, 100))
+                    .ok()
+            });
+            if let Some(kl) = klines {
+                tr.klines = kl;
+            }
             trackers.insert(symbol.clone(), tr);
         }
 
@@ -673,7 +563,7 @@ impl RealtimeEngine {
 
         let (sl_pct, tp_pct, reverse, ghost_threshold) = (*self.sl_percent.read().unwrap(), *self.tp_percent.read().unwrap(), *self.reverse_mode.read().unwrap(), *self.ghost_threshold.read().unwrap());
 
-        if let Some(sym) = topic.strip_prefix("kline.1.") {
+        if let Some(sym) = topic.strip_prefix("kline.15.") {
             if data.get("confirm").and_then(|c| c.as_bool()) == Some(true) {
                 let kline = self.parse_kline(&data);
                 if let Some(kl) = kline {
@@ -719,7 +609,7 @@ impl RealtimeEngine {
                     let mut trackers = self.trackers.write().unwrap();
                     trackers
                         .get_mut(sym)
-                        .map(|tr| tr.update_ticker(b, a, sl_pct, tp_pct, reverse, ghost_threshold))
+                        .map(|tr| tr.update_ticker(b, a, sl_pct, tp_pct, ghost_threshold))
                         .unwrap_or_default()
                 };
                 for ev in events {
@@ -800,7 +690,7 @@ impl RealtimeEngine {
                             let args: Vec<String> = syms
                                 .iter()
                                 .flat_map(|s| {
-                                    vec![format!("kline.1.{s}"), format!("tickers.{s}")]
+                                    vec![format!("kline.15.{s}"), format!("tickers.{s}")]
                                 })
                                 .collect();
                             let sub = serde_json::json!({"op": "subscribe", "args": args});
@@ -820,14 +710,14 @@ impl RealtimeEngine {
                                 WsCommand::Subscribe(sym) => serde_json::json!({
                                     "op": "subscribe",
                                     "args": [
-                                        format!("kline.1.{sym}"),
+                                        format!("kline.15.{sym}"),
                                         format!("tickers.{sym}")
                                     ]
                                 }),
                                 WsCommand::Unsubscribe(sym) => serde_json::json!({
                                     "op": "unsubscribe",
                                     "args": [
-                                        format!("kline.1.{sym}"),
+                                        format!("kline.15.{sym}"),
                                         format!("tickers.{sym}")
                                     ]
                                 }),
@@ -836,7 +726,7 @@ impl RealtimeEngine {
                                         .iter()
                                         .flat_map(|s| {
                                             vec![
-                                                format!("kline.1.{s}"),
+                                                format!("kline.15.{s}"),
                                                 format!("tickers.{s}"),
                                             ]
                                         })
@@ -937,11 +827,11 @@ impl RealtimeEngine {
 
         let mut active_rows = String::new();
         let mut closed_rows = String::new();
-        let mut all_closed: Vec<GridTrade> = Vec::new();
+        let mut all_closed: Vec<Trade> = Vec::new();
         let mut summary = DashboardSummary::default();
 
         for (_sym, tr) in &trackers {
-            if let Some(ref t) = tr.active_trade {
+            for t in &tr.active_trades {
                 let live_price = tr.current_price.unwrap_or(t.entry_price);
                 let unrealized = match t.direction {
                     TradeDirection::Long => {
@@ -960,7 +850,6 @@ impl RealtimeEngine {
                         "<tr class=\"ghost-row\">\
                          <td>{}</td>\
                          <td class=\"orange\">{}</td>\
-                         <td>L{}</td>\
                          <td>{}</td>\
                          <td>{:.4}</td>\
                          <td>{:.4}</td>\
@@ -968,7 +857,7 @@ impl RealtimeEngine {
                          <td style=\"color:orange\">GHOST</td>\
                          <td><a href=\"/viewtrades/{}\">Chart</a></td>\
                          </tr>\n",
-                        t.symbol, d_lbl, t.level, et, t.entry_price,
+                        t.symbol, d_lbl, et, t.entry_price,
                         t.sl, t.tp, t.symbol,
                     ));
                 } else {
@@ -976,7 +865,6 @@ impl RealtimeEngine {
                         "<tr>\
                          <td>{}</td>\
                          <td class=\"{}\">{}</td>\
-                         <td>L{}</td>\
                          <td>{}</td>\
                          <td>{:.4}</td>\
                          <td>{:.4}</td>\
@@ -987,7 +875,6 @@ impl RealtimeEngine {
                         t.symbol,
                         d_cls,
                         d_lbl,
-                        t.level,
                         et,
                         t.entry_price,
                         t.sl,
@@ -1038,14 +925,13 @@ impl RealtimeEngine {
                     "<tr class=\"ghost-row\">\
                      <td>{}</td>\
                      <td class=\"orange\">{}</td>\
-                     <td>L{}</td>\
                      <td>{}</td>\
                      <td>{}</td>\
                      <td>{:.4}</td>\
                      <td>{}</td>\
                      <td style=\"color:orange\">GHOST</td>\
                      </tr>\n",
-                    t.symbol, d_lbl, t.level, et, ext,
+                    t.symbol, d_lbl, et, ext,
                     t.entry_price, t.exit_price.unwrap_or(0.0),
                 ));
             } else {
@@ -1056,7 +942,6 @@ impl RealtimeEngine {
                     "<tr>\
                      <td>{}</td>\
                      <td class=\"{}\">{}</td>\
-                     <td>L{}</td>\
                      <td>{}</td>\
                      <td>{}</td>\
                      <td>{:.4}</td>\
@@ -1066,7 +951,6 @@ impl RealtimeEngine {
                     t.symbol,
                     d_cls,
                     d_lbl,
-                    t.level,
                     et,
                     ext,
                     t.entry_price,
@@ -1119,25 +1003,29 @@ impl RealtimeEngine {
         let symlist: String = trackers
             .iter()
             .map(|(sym, tr)| {
-                let pos_str = if let Some(ref t) = tr.active_trade {
-                    let d = dir_label(t.direction);
-                    if t.is_ghost {
-                        format!("{} L{} <span class=\"orange\">GHOST</span>", d, t.level)
-                    } else {
-                        let u = tr
-                            .current_price
-                            .zip(Some(t.entry_price))
-                            .map(|(p, e)| match t.direction {
-                                TradeDirection::Long => (p - e) / e * 100.0,
-                                TradeDirection::Short => (e - p) / e * 100.0,
-                            })
-                            .map(|pnl| {
-                                let c = pnl_class(pnl);
-                                format!("<span class=\"{c}\">{pnl:+.2}%</span>")
-                            })
-                            .unwrap_or_else(|| "<span style=\"color:#8b949e\">flat</span>".to_string());
-                        format!("{d} L{} {}", t.level, u)
-                    }
+                let pos_count = tr.active_trades.len();
+                let pos_str = if pos_count > 0 {
+                    let dirs: String = tr.active_trades.iter().map(|t| {
+                        let d = dir_label(t.direction);
+                        if t.is_ghost {
+                            format!("{} <span class=\"orange\">GHOST</span>", d)
+                        } else {
+                            let u = tr
+                                .current_price
+                                .zip(Some(t.entry_price))
+                                .map(|(p, e)| match t.direction {
+                                    TradeDirection::Long => (p - e) / e * 100.0,
+                                    TradeDirection::Short => (e - p) / e * 100.0,
+                                })
+                                .map(|pnl| {
+                                    let c = pnl_class(pnl);
+                                    format!("<span class=\"{c}\">{pnl:+.2}%</span>")
+                                })
+                                .unwrap_or_else(|| "<span style=\"color:#8b949e\">flat</span>".to_string());
+                            format!("{} {}", d, u)
+                        }
+                    }).collect::<Vec<_>>().join(", ");
+                    dirs
                 } else {
                     "<span style=\"color:#8b949e\">flat</span>".to_string()
                 };
@@ -1145,14 +1033,12 @@ impl RealtimeEngine {
                 let ghost_suffix = if ghost_ct > 0 { format!(" ({} ghost)", ghost_ct) } else { String::new() };
                 format!(
                     "<li>\
-                     <b>{sym}</b> base={base:.2} step={step:.3}% \
+                     <b>{sym}</b> \
                      | pos: {pos_str} \
                      | trades: {attempts}{ghost_suffix} \
                      | <a href=\"/viewtrades/{sym}\">chart</a> \
                      | <a href=\"/removeSymbol/{sym}\" style=\"color:#ef5350;font-size:0.8em\">remove</a>\
                      </li>",
-                    base = tr.base_price,
-                    step = 0.5,
                     attempts = tr.total_attempts(),
                 )
             })
@@ -1173,21 +1059,20 @@ impl RealtimeEngine {
         };
 
         let active_display = if active_rows.is_empty() {
-            "<tr><td colspan=\"10\" style=\"text-align:center;color:#8b949e\">No active trades</td></tr>"
+            "<tr><td colspan=\"9\" style=\"text-align:center;color:#8b949e\">No active trades</td></tr>"
                 .to_string()
         } else {
             active_rows
         };
 
         let closed_display = if closed_rows.is_empty() {
-            "<tr><td colspan=\"8\" style=\"text-align:center;color:#8b949e\">No closed trades</td></tr>"
+            "<tr><td colspan=\"7\" style=\"text-align:center;color:#8b949e\">No closed trades</td></tr>"
                 .to_string()
         } else {
             closed_rows
         };
 
-        let (sl_pct, tp_pct, rev) = (*self.sl_percent.read().unwrap(), *self.tp_percent.read().unwrap(), *self.reverse_mode.read().unwrap());
-        let rev_tag = if rev { " <span style=\"color:#ef5350;font-weight:700\">[REVERSE]</span>" } else { "" };
+        let (sl_pct, tp_pct) = (*self.sl_percent.read().unwrap(), *self.tp_percent.read().unwrap());
 
         format!(
             r#"<!DOCTYPE html>
@@ -1223,9 +1108,9 @@ impl RealtimeEngine {
 </style>
 </head>
 <body>
-<h1>Grid Trading Engine{rev_tag}</h1>
+<h1>Pattern Trading Engine</h1>
 <p style="color:#8b949e;margin:4px 0 12px;font-size:0.9em">
-  Grid: 0.5% &middot; SL: {sl_pct}% &middot; TP: {tp_pct}%
+  SL: {sl_pct}% &middot; TP: {tp_pct}%
   &middot; <a href="/config">Config</a>
 </p>
 
@@ -1271,12 +1156,12 @@ impl RealtimeEngine {
 </div>
 
 <h2>Active Trades</h2>
-<table><thead><tr><th>Symbol</th><th>Dir</th><th>Level</th><th>Entry Time</th><th>Entry $</th><th>SL</th><th>TP</th><th>Unrealized</th><th>View</th></tr></thead><tbody>
+<table><thead><tr><th>Symbol</th><th>Dir</th><th>Entry Time</th><th>Entry $</th><th>SL</th><th>TP</th><th>Unrealized</th><th>View</th></tr></thead><tbody>
 {active_display}
 </tbody></table>
 
 <h2>Closed Trades <span style="font-size:0.7em;color:#8b949e">(last 50)</span></h2>
-<table><thead><tr><th>Symbol</th><th>Dir</th><th>Level</th><th>Entry</th><th>Exit</th><th>Entry $</th><th>Exit $</th><th>PnL</th></tr></thead><tbody>
+<table><thead><tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Entry $</th><th>Exit $</th><th>PnL</th></tr></thead><tbody>
 {closed_display}
 </tbody></table>
 
@@ -1295,7 +1180,6 @@ impl RealtimeEngine {
             total_pnl_cls = pnl_class(summary.total_pnl),
             unrealized_pnl = summary.unrealized_pnl,
             upnl_cls = pnl_class(summary.unrealized_pnl),
-            rev_tag = rev_tag,
             sl_pct = sl_pct,
             tp_pct = tp_pct,
             combined = combined,
@@ -1327,12 +1211,13 @@ impl RealtimeEngine {
         let sym_rows: String = trackers
             .iter()
             .map(|(sym, tr)| {
-                let state = if tr.active_trade.is_some() {
+                let pos_count = tr.active_trades.len();
+                let state = if pos_count > 0 {
                     "IN"
                 } else {
                     "flat"
                 };
-                let state_color = if tr.active_trade.is_some() {
+                let state_color = if pos_count > 0 {
                     "#4caf50"
                 } else {
                     "#8b949e"
@@ -1340,14 +1225,12 @@ impl RealtimeEngine {
                 format!(
                     "<tr>\
                      <td><a href=\"/viewtrades/{}\">{}</a></td>\
-                     <td>{:.2}</td>\
                      <td style=\"color:{}\">{}</td>\
                      <td>{} trades</td>\
                      <td><a href=\"/removeSymbol/{}\" style=\"color:#ef5350\">remove</a></td>\
                      </tr>\n",
                     sym,
                     sym,
-                    tr.base_price,
                     state_color,
                     state,
                     tr.total_attempts(),
@@ -1405,14 +1288,14 @@ impl RealtimeEngine {
   <a href="/config">Config</a>
   <a href="/state">State</a>
 </div>
-<h1>Manage Grid Engine</h1>
+<h1>Manage Trading Engine</h1>
 
 <div class="card">
   <h3>Subscribe to Signals <span class="badge">{subs_count} active</span></h3>
   <p style="color:#8b949e;font-size:0.85em;margin-bottom:12px">
-    Subscribers follow all grid signals automatically (both Long and Short).
-    When any watched symbol enters a grid position, all subscribers execute
-    the same direction with their configured USDT size.
+    Subscribers follow all trade signals automatically (both Long and Short).
+    When any watched symbol enters a position based on 15-min candle patterns,
+    all subscribers execute the same direction with their configured USDT size.
   </p>
   <form action="/subscribe" method="get">
     <input type="hidden" name="redirect" value="subs">
@@ -1434,9 +1317,9 @@ impl RealtimeEngine {
 <div class="card">
   <h3>Watch Symbols <span class="badge">{syms_count} watching</span></h3>
   <p style="color:#8b949e;font-size:0.85em;margin-bottom:12px">
-    Add symbols to watch. Price at subscription becomes the base level.
-    Grid levels are spaced at 0.5% intervals. The engine opens 1:3 R:R trades
-    when price crosses levels.
+    Add symbols to watch. The engine monitors 15-min candles for 4-candle patterns:
+    LONG on red→green→green→green, SHORT on green→red→red→red.
+    Positions use configured SL/TP percentages.
   </p>
   <form action="/watch" method="get">
     <label>Symbol:</label><input name="symbol" placeholder="BTCUSDT" style="width:120px" required>
@@ -1445,7 +1328,7 @@ impl RealtimeEngine {
 </div>
 
 <h3>Watched Symbols</h3>
-<table><thead><tr><th>Symbol</th><th>Base</th><th>State</th><th>Trades</th><th></th></tr></thead><tbody>
+<table><thead><tr><th>Symbol</th><th>State</th><th>Trades</th><th></th></tr></thead><tbody>
 {sym_display}
 </tbody></table>
 
@@ -1465,8 +1348,10 @@ impl RealtimeEngine {
         let chart = generate_chart_svg(&tr);
         let total_pnl: f64 = tr.closed_trades.iter().filter(|t| !t.is_ghost).map(|t| t.pnl_pct()).sum();
         let ghost_count = tr.closed_trades.iter().filter(|t| t.is_ghost).count();
-        let (state_bold, state_cls) = if tr.active_trade.is_some() {
-            if tr.active_trade.as_ref().map(|t| t.is_ghost).unwrap_or(false) {
+        let has_active = !tr.active_trades.is_empty();
+        let active_t = tr.active_trades.first();
+        let (state_bold, state_cls) = if has_active {
+            if active_t.map(|t| t.is_ghost).unwrap_or(false) {
                 ("GHOST", "orange")
             } else {
                 ("IN POSITION", "green")
@@ -1474,19 +1359,13 @@ impl RealtimeEngine {
         } else {
             ("FLAT", "red")
         };
-        let entry_str = tr
-            .active_trade
-            .as_ref()
-            .map(|t| format!("{:.4} (L{})", t.entry_price, t.level))
+        let entry_str = active_t
+            .map(|t| format!("{:.4}", t.entry_price))
             .unwrap_or_else(|| "-".to_string());
-        let sl_str = tr
-            .active_trade
-            .as_ref()
+        let sl_str = active_t
             .map(|t| format!("{:.4}", t.sl))
             .unwrap_or_else(|| "-".to_string());
-        let tp_str = tr
-            .active_trade
-            .as_ref()
+        let tp_str = active_t
             .map(|t| format!("{:.4}", t.tp))
             .unwrap_or_else(|| "-".to_string());
 
@@ -1509,7 +1388,6 @@ impl RealtimeEngine {
                     "<tr class=\"ghost-row\">\
                      <td>{}</td>\
                      <td class=\"orange\">{}</td>\
-                     <td>L{}</td>\
                      <td>{et}</td>\
                      <td>{ext}</td>\
                      <td>{:.4}</td>\
@@ -1519,7 +1397,6 @@ impl RealtimeEngine {
                      </tr>\n",
                     i + 1,
                     dir_label(t.direction),
-                    t.level,
                     t.entry_price,
                     t.exit_price.unwrap_or(0.0),
                 ));
@@ -1530,7 +1407,6 @@ impl RealtimeEngine {
                     "<tr>\
                      <td>{}</td>\
                      <td>{}</td>\
-                     <td>L{}</td>\
                      <td>{et}</td>\
                      <td>{ext}</td>\
                      <td>{:.4}</td>\
@@ -1540,19 +1416,18 @@ impl RealtimeEngine {
                      </tr>\n",
                     i + 1,
                     dir_label(t.direction),
-                    t.level,
                     t.entry_price,
                     t.exit_price.unwrap_or(0.0),
                 ));
             }
         }
         if closed_rows.is_empty() {
-            closed_rows = "<tr><td colspan=\"9\" style=\"color:#8b949e;text-align:center\">No closed trades</td></tr>".to_string();
+            closed_rows = "<tr><td colspan=\"8\" style=\"color:#8b949e;text-align:center\">No closed trades</td></tr>".to_string();
         }
 
         Some(format!(
             r#"<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>{symbol} Grid Trades</title>
+<html><head><meta charset="UTF-8"><title>{symbol} — Pattern Trades</title>
 <style>
   body {{ font-family:Segoe UI,sans-serif; background:#0d1117; color:#c9d1d9; padding:20px }}
   h1,h2 {{ color:#f0f6fc }}
@@ -1563,8 +1438,8 @@ impl RealtimeEngine {
   .ghost-row {{ opacity:0.65 }}
   a {{ color:#58a6ff }}
 </style></head><body>
-<h1>{symbol} &mdash; Grid Bot</h1>
-<p>Base: {base:.4} | Step: 0.5% | State: <b class="{state_cls}">{state_bold}</b>
+<h1>{symbol} &mdash; Pattern Bot</h1>
+<p>State: <b class="{state_cls}">{state_bold}</b>
  | Active Entry: {entry_str}
  | SL: {sl_str}
  | TP: {tp_str}
@@ -1573,13 +1448,12 @@ impl RealtimeEngine {
 {chart}
 
 <h2>Closed Trades</h2>
-<table><thead><tr><th>#</th><th>Dir</th><th>Level</th><th>Entry Time</th><th>Exit Time</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Duration</th></tr></thead><tbody>
+<table><thead><tr><th>#</th><th>Dir</th><th>Entry Time</th><th>Exit Time</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Duration</th></tr></thead><tbody>
 {closed_rows}
 </tbody></table>
 <p><a href="/">Back to dashboard</a></p>
 </body></html>"#,
             symbol = symbol,
-            base = tr.base_price,
             state_cls = state_cls,
             state_bold = state_bold,
             entry_str = entry_str,
@@ -1597,26 +1471,24 @@ impl RealtimeEngine {
         let ws_connected = self.ws_sender.lock().unwrap().is_some();
         let mut lines = Vec::new();
         for (sym, tr) in &trackers {
-            let active = tr
-                .active_trade
-                .as_ref()
-                .map(|t| {
+            let active = if tr.active_trades.is_empty() {
+                "flat".to_string()
+            } else {
+                tr.active_trades.iter().map(|t| {
                     let ghost_tag = if t.is_ghost { " [GHOST]" } else { "" };
                     format!(
-                        "L{} {}{} EP={} SL={} TP={}",
-                        t.level,
+                        "{}{} EP={} SL={} TP={}",
                         t.direction.upper(),
                         ghost_tag,
                         t.entry_price,
                         t.sl,
                         t.tp
                     )
-                })
-                .unwrap_or_else(|| "flat".to_string());
+                }).collect::<Vec<_>>().join(" | ")
+            };
             let ghost_ct = tr.closed_trades.iter().filter(|t| t.is_ghost).count();
             lines.push(format!(
-                "<b>{sym}</b> base={bp:.4} step=0.5% | current={cp} | active: {active} | klines={kc} | closed_trades={ct}{ghost_str} | ghost_left={gl} | triggered={trig} | ws={ws}",
-                bp = tr.base_price,
+                "<b>{sym}</b> | current={cp} | active: {active} | klines={kc} | closed_trades={ct}{ghost_str} | ghost_left={gl} | triggered={trig} | ws={ws}",
                 cp = tr.current_price.map(|p| format!("{p}")).unwrap_or_else(|| "None".to_string()),
                 kc = tr.klines.len(),
                 ct = tr.closed_trades.len(),
@@ -1666,9 +1538,6 @@ impl RealtimeEngine {
 
         fn level_of(price: f64, base: f64) -> i32 {
             ((price / base - 1.0) / 0.005).round() as i32
-        }
-        fn price_for_level(level: i32, base: f64) -> f64 {
-            base * (1.0 + level as f64 * 0.005)
         }
 
         // level crossing count + oscillation analysis
@@ -1802,9 +1671,6 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
         return "<p style=\"color:gray\">Not enough data yet.</p>".to_string();
     }
 
-    let base = tr.base_price;
-    let _step = tr.level_step;
-
     let chart_w = 800.0;
     let chart_h = 350.0;
     let pnl_h = 130.0;
@@ -1844,7 +1710,7 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
 
     // Compute realized PnL at each kline index
     let mut pnl_line: Vec<f64> = vec![0.0; klines.len()];
-    let mut _active_trade_range: Option<(usize, usize, GridTrade)> = None;
+    let mut _active_trade_range: Option<(usize, usize, Trade)> = None;
 
     // Reconstruct trade timeline: find each closed trade's range
     for t in &tr.closed_trades {
@@ -1868,8 +1734,8 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
         }
     }
 
-    // Active trade
-    if let Some(ref t) = tr.active_trade {
+    // Active trades
+    for t in &tr.active_trades {
         let entry_i = klines
             .iter()
             .position(|k| k.datetime >= t.entry_time)
@@ -1906,8 +1772,7 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
   .wick-up {{ stroke:#26a69a }}
   .wick-dn {{ stroke:#ef5350 }}
   .grid-line {{ stroke:#30363d;stroke-width:0.5 }}
-  .grid-base {{ stroke:#f0f6fc;stroke-width:1;stroke-dasharray:6,3 }}
-  .grid-level {{ stroke:#30363d;stroke-width:0.5;stroke-dasharray:2,4 }}
+
   .marker-entry-long {{ fill:#4caf50;stroke:#000;stroke-width:0.5 }}
   .marker-entry-short {{ fill:#ef5350;stroke:#000;stroke-width:0.5 }}
   .marker-ghost {{ fill:#ff9800;stroke:#000;stroke-width:0.5 }}
@@ -1943,30 +1808,6 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
         s.push_str(&format!(
             r###"<text x="{tx}" y="{y}" class="axis-text" text-anchor="end" dominant-baseline="middle">{price:.2}</text>"###,
             tx = margin_l - 5.0,
-        ));
-    }
-
-    // grid level lines (0.5% intervals)
-    for lvl_offset in -100i32..=100i32 {
-        let price = base * (1.0 + lvl_offset as f64 * 0.005);
-        if price < min_price || price > max_price {
-            continue;
-        }
-        let y = to_y(price);
-        let cls = if lvl_offset == 0 {
-            "grid-base"
-        } else {
-            "grid-level"
-        };
-        s.push_str(&format!(
-            r###"<line x1="{ml}" y1="{y}" x2="{mr}" y2="{y}" class="{cls}"/>"###,
-            ml = margin_l,
-            mr = margin_l + plot_w
-        ));
-        s.push_str(&format!(
-            r###"<text x="{tx}" y="{y}" fill="#8b949e" font-size="8" font-family="monospace" text-anchor="start" dominant-baseline="middle">L{level}</text>"###,
-            tx = margin_l + plot_w + 3.0,
-            level = lvl_offset,
         ));
     }
 
@@ -2052,8 +1893,8 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
         }
     }
 
-    // active trade marker
-    if let Some(ref t) = tr.active_trade {
+    // active trade markers
+    for t in &tr.active_trades {
         let entry_i = klines.iter().position(|k| k.datetime >= t.entry_time);
         if let Some(ei) = entry_i {
             let ex = to_x(ei);

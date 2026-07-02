@@ -2,11 +2,21 @@ use crate::trade_manager;
 use chrono::{DateTime, Duration, Utc};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+// ─── Alligator Constants ─────────────────────────────────────────────────
+
+const JAW_PERIOD: usize = 13;
+const TEETH_PERIOD: usize = 8;
+const LIPS_PERIOD: usize = 5;
+const JAW_DISPLACEMENT: usize = 8;
+const TEETH_DISPLACEMENT: usize = 5;
+const LIPS_DISPLACEMENT: usize = 3;
+const MAX_CLOSE_POOL: usize = 500;
 
 // ─── Types ────────────────────────────────────────────────────────────────
 
@@ -51,7 +61,6 @@ pub struct Subscriber {
 #[derive(Debug, Clone)]
 pub struct GridTrade {
     pub symbol: String,
-    pub level: i32,
     pub direction: TradeDirection,
     pub entry_time: DateTime<Utc>,
     pub entry_price: f64,
@@ -61,12 +70,30 @@ pub struct GridTrade {
     pub exit_price: Option<f64>,
     pub status: TradeStatus,
     pub is_ghost: bool,
+    pub signal_label: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TradeStatus {
     Open,
     Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AlligatorAlignment {
+    Bullish,
+    Bearish,
+    Mixed,
+}
+
+impl AlligatorAlignment {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AlligatorAlignment::Bullish => "BULLISH",
+            AlligatorAlignment::Bearish => "BEARISH",
+            AlligatorAlignment::Mixed => "MIXED",
+        }
+    }
 }
 
 impl GridTrade {
@@ -87,18 +114,51 @@ impl GridTrade {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct GridScore {
+pub struct AlligatorScore {
     pub symbol: String,
     pub base_price: f64,
-    pub price_range_pct: f64,
-    pub level_crosses: u32,
-    pub oscillation_score: f64,
+    pub total_signals: u32,
     pub total_trades: u32,
     pub wins: u32,
     pub losses: u32,
     pub total_pnl_pct: f64,
     pub win_rate: f64,
+    pub max_drawdown_pct: f64,
     pub suitability: f64,
+}
+
+// ─── SMMA (Smoothed Moving Average) ──────────────────────────────────────
+
+fn calc_smma(values: &VecDeque<f64>, period: usize) -> VecDeque<f64> {
+    if values.len() < period {
+        return VecDeque::new();
+    }
+    let mut result = VecDeque::with_capacity(values.len() - period + 1);
+    let sum: f64 = values.iter().take(period).sum();
+    result.push_back(sum / period as f64);
+    for i in period..values.len() {
+        let prev = result.back().copied().unwrap();
+        let val = (prev * (period as f64 - 1.0) + values[i]) / period as f64;
+        result.push_back(val);
+    }
+    result
+}
+
+fn get_displaced(smma: &VecDeque<f64>, displacement: usize) -> Option<f64> {
+    if smma.len() <= displacement {
+        return None;
+    }
+    smma.get(smma.len() - 1 - displacement).copied()
+}
+
+fn determine_alignment(lips: f64, teeth: f64, jaw: f64) -> AlligatorAlignment {
+    if lips > teeth && teeth > jaw {
+        AlligatorAlignment::Bullish
+    } else if lips < teeth && teeth < jaw {
+        AlligatorAlignment::Bearish
+    } else {
+        AlligatorAlignment::Mixed
+    }
 }
 
 // ─── SymbolTracker ────────────────────────────────────────────────────────
@@ -107,14 +167,22 @@ pub struct GridScore {
 pub struct SymbolTracker {
     pub symbol: String,
     pub base_price: f64,
-    pub level_step: f64,
-    pub last_close_level: Option<i32>,
     pub klines: Vec<KlineData>,
     pub current_price: Option<f64>,
     pub active_trade: Option<GridTrade>,
     pub closed_trades: Vec<GridTrade>,
     pub ghost_remaining: i32,
     pub ghost_triggered: bool,
+    pub close_prices: VecDeque<f64>,
+    pub jaw_values: VecDeque<f64>,
+    pub teeth_values: VecDeque<f64>,
+    pub lips_values: VecDeque<f64>,
+    pub alignment: AlligatorAlignment,
+    pub prev_alignment: AlligatorAlignment,
+    pub alignment_changed: bool,
+    pub jaw_val: f64,
+    pub teeth_val: f64,
+    pub lips_val: f64,
 }
 
 impl SymbolTracker {
@@ -122,23 +190,23 @@ impl SymbolTracker {
         SymbolTracker {
             symbol,
             base_price,
-            level_step: base_price * 0.005,
-            last_close_level: None,
             klines: Vec::new(),
             current_price: Some(base_price),
             active_trade: None,
             closed_trades: Vec::new(),
             ghost_remaining: 0,
             ghost_triggered: false,
+            close_prices: VecDeque::with_capacity(MAX_CLOSE_POOL),
+            jaw_values: VecDeque::new(),
+            teeth_values: VecDeque::new(),
+            lips_values: VecDeque::new(),
+            alignment: AlligatorAlignment::Mixed,
+            prev_alignment: AlligatorAlignment::Mixed,
+            alignment_changed: false,
+            jaw_val: 0.0,
+            teeth_val: 0.0,
+            lips_val: 0.0,
         }
-    }
-
-    fn level_to_price(&self, level: i32) -> f64 {
-        self.base_price * (1.0 + level as f64 * 0.005)
-    }
-
-    fn price_to_level(&self, price: f64) -> i32 {
-        ((price / self.base_price - 1.0) / 0.005).round() as i32
     }
 
     pub fn total_attempts(&self) -> usize {
@@ -147,10 +215,38 @@ impl SymbolTracker {
         closed + active
     }
 
-    pub fn process_kline(&mut self, kline: &KlineData, sl_pct: f64, tp_pct: f64, reverse: bool, ghost_threshold: i32) -> Vec<TrackerEvent> {
-        let close = kline.close;
+    fn recalc_alligator(&mut self) {
+        if self.close_prices.len() < JAW_PERIOD {
+            return;
+        }
+        let jaw_raw = calc_smma(&self.close_prices, JAW_PERIOD);
+        let teeth_raw = calc_smma(&self.close_prices, TEETH_PERIOD);
+        let lips_raw = calc_smma(&self.close_prices, LIPS_PERIOD);
+
+        self.jaw_values = jaw_raw;
+        self.teeth_values = teeth_raw;
+        self.lips_values = lips_raw;
+
+        self.jaw_val = get_displaced(&self.jaw_values, JAW_DISPLACEMENT).unwrap_or(0.0);
+        self.teeth_val = get_displaced(&self.teeth_values, TEETH_DISPLACEMENT).unwrap_or(0.0);
+        self.lips_val = get_displaced(&self.lips_values, LIPS_DISPLACEMENT).unwrap_or(0.0);
+
+        let has_displaced = self.jaw_values.len() > JAW_DISPLACEMENT
+            && self.teeth_values.len() > TEETH_DISPLACEMENT
+            && self.lips_values.len() > LIPS_DISPLACEMENT;
+
+        if has_displaced {
+            let new_alignment = determine_alignment(self.lips_val, self.teeth_val, self.jaw_val);
+            self.prev_alignment = self.alignment;
+            self.alignment = new_alignment;
+            self.alignment_changed = self.prev_alignment != self.alignment;
+        }
+    }
+
+    pub fn process_kline(&mut self, kline: &KlineData, sl_pct: f64, tp_pct: f64, _reverse: bool, ghost_threshold: i32) -> Vec<TrackerEvent> {
         let high = kline.high;
         let low = kline.low;
+        let close = kline.close;
         let dt = kline.datetime;
 
         self.klines.push(kline.clone());
@@ -159,29 +255,30 @@ impl SymbolTracker {
         }
         self.current_price = Some(close);
 
+        self.close_prices.push_back(close);
+        if self.close_prices.len() > MAX_CLOSE_POOL {
+            self.close_prices.pop_front();
+        }
+
         let mut events = Vec::new();
 
-        let curr_level = self.price_to_level(close);
-        let prev_level = self.last_close_level.unwrap_or(curr_level);
-        self.last_close_level = Some(curr_level);
-
-        // ── Check exit (SL / TP) ──────────────────────────────────
+        // ── SL/TP exit check (price-based, always runs) ────────────
         if let Some(ref trade) = self.active_trade {
             let (should_exit, exit_price) = match trade.direction {
                 TradeDirection::Long => {
                     if low <= trade.sl {
-                        (true, low) // SL fill at worst price (low breached)
+                        (true, low)
                     } else if high >= trade.tp {
-                        (true, trade.tp) // TP limit fills at target
+                        (true, trade.tp)
                     } else {
                         (false, 0.0)
                     }
                 }
                 TradeDirection::Short => {
                     if high >= trade.sl {
-                        (true, high) // SL fill at worst price (high breached)
+                        (true, high)
                     } else if low <= trade.tp {
-                        (true, trade.tp) // TP limit fills at target
+                        (true, trade.tp)
                     } else {
                         (false, 0.0)
                     }
@@ -192,9 +289,6 @@ impl SymbolTracker {
                 t.exit_time = Some(dt);
                 t.exit_price = Some(exit_price);
                 t.status = TradeStatus::Closed;
-                // Ghost mode: after a real loss, next 3 trades are ghosts.
-                // Only triggers once per cycle — subsequent losses won't re-trigger
-                // until a win resets it.
                 if !t.is_ghost {
                     let was_loss = match t.direction {
                         TradeDirection::Long => exit_price < t.entry_price,
@@ -212,76 +306,109 @@ impl SymbolTracker {
                 events.push(TrackerEvent::Exited {
                     symbol: self.symbol.clone(),
                     direction: t.direction,
-                    level: t.level,
                     is_ghost: t.is_ghost,
                 });
             }
         }
 
-        // ── Check entry (level crossing, at most 1 active trade) ──
-        if self.active_trade.is_none() && curr_level != prev_level {
-            let is_ghost = self.ghost_remaining > 0;
-            if is_ghost {
-                self.ghost_remaining -= 1;
+        // ── Recalculate alligator SMMAs ────────────────────────────
+        self.recalc_alligator();
+
+        // ── Alignment-based exit ───────────────────────────────────
+        if self.alignment_changed && self.active_trade.is_some() {
+            let should_exit = match self.active_trade.as_ref().unwrap().direction {
+                TradeDirection::Long => self.alignment != AlligatorAlignment::Bullish,
+                TradeDirection::Short => self.alignment != AlligatorAlignment::Bearish,
+            };
+            if should_exit {
+                let mut t = self.active_trade.take().unwrap();
+                t.exit_time = Some(dt);
+                t.exit_price = Some(close);
+                t.status = TradeStatus::Closed;
+                if !t.is_ghost {
+                    let was_loss = match t.direction {
+                        TradeDirection::Long => close < t.entry_price,
+                        TradeDirection::Short => close > t.entry_price,
+                    };
+                    if ghost_threshold > 0 && was_loss && !self.ghost_triggered {
+                        self.ghost_remaining = ghost_threshold;
+                        self.ghost_triggered = true;
+                    } else if !was_loss {
+                        self.ghost_remaining = 0;
+                        self.ghost_triggered = false;
+                    }
+                }
+                self.closed_trades.push(t.clone());
+                events.push(TrackerEvent::Exited {
+                    symbol: self.symbol.clone(),
+                    direction: t.direction,
+                    is_ghost: t.is_ghost,
+                });
             }
-            let (direction, entry_price) = if curr_level > prev_level {
-                // price moved up → enter SHORT (mean reversion), or LONG if reversed
-                if reverse {
-                    (TradeDirection::Long, close)
-                } else {
-                    (TradeDirection::Short, close)
-                }
-            } else {
-                // price moved down → enter LONG (mean reversion), or SHORT if reversed
-                if reverse {
-                    (TradeDirection::Short, close)
-                } else {
-                    (TradeDirection::Long, close)
-                }
+        }
+
+        // ── Alignment-based entry ──────────────────────────────────
+        if self.alignment_changed && self.active_trade.is_none() {
+            let should_enter = match self.alignment {
+                AlligatorAlignment::Bullish => true,
+                AlligatorAlignment::Bearish => true,
+                AlligatorAlignment::Mixed => false,
             };
-            let (sl, tp) = match direction {
-                TradeDirection::Long => {
-                    (entry_price * (1.0 - sl_pct / 100.0), entry_price * (1.0 + tp_pct / 100.0))
+            if should_enter {
+                let direction = match self.alignment {
+                    AlligatorAlignment::Bullish => TradeDirection::Long,
+                    AlligatorAlignment::Bearish => TradeDirection::Short,
+                    AlligatorAlignment::Mixed => unreachable!(),
+                };
+                let is_ghost = self.ghost_remaining > 0;
+                if is_ghost {
+                    self.ghost_remaining -= 1;
                 }
-                TradeDirection::Short => {
-                    (entry_price * (1.0 + sl_pct / 100.0), entry_price * (1.0 - tp_pct / 100.0))
-                }
-            };
-            self.active_trade = Some(GridTrade {
-                symbol: self.symbol.clone(),
-                level: curr_level,
-                direction,
-                entry_time: dt,
-                entry_price,
-                sl,
-                tp,
-                exit_time: None,
-                exit_price: None,
-                status: TradeStatus::Open,
-                is_ghost,
-            });
-            events.push(TrackerEvent::Entered {
-                symbol: self.symbol.clone(),
-                direction,
-                price: entry_price,
-                level: curr_level,
-                sl,
-                tp,
-                is_ghost,
-            });
+                let entry_price = close;
+                let (sl, tp) = match direction {
+                    TradeDirection::Long => {
+                        (entry_price * (1.0 - sl_pct / 100.0), entry_price * (1.0 + tp_pct / 100.0))
+                    }
+                    TradeDirection::Short => {
+                        (entry_price * (1.0 + sl_pct / 100.0), entry_price * (1.0 - tp_pct / 100.0))
+                    }
+                };
+                let label = format!("{}→{}", self.prev_alignment.as_str(), self.alignment.as_str());
+                self.active_trade = Some(GridTrade {
+                    symbol: self.symbol.clone(),
+                    direction,
+                    entry_time: dt,
+                    entry_price,
+                    sl,
+                    tp,
+                    exit_time: None,
+                    exit_price: None,
+                    status: TradeStatus::Open,
+                    is_ghost,
+                    signal_label: label,
+                });
+                events.push(TrackerEvent::Entered {
+                    symbol: self.symbol.clone(),
+                    direction,
+                    price: entry_price,
+                    sl,
+                    tp,
+                    is_ghost,
+                });
+            }
         }
 
         events
     }
 
-    pub fn update_ticker(&mut self, bid: f64, ask: f64, sl_pct: f64, tp_pct: f64, reverse: bool, ghost_threshold: i32) -> Vec<TrackerEvent> {
-        self.current_price = Some((bid + ask) / 2.0); // mid for display
+    pub fn update_ticker(&mut self, bid: f64, ask: f64, _sl_pct: f64, _tp_pct: f64, _reverse: bool, _ghost_threshold: i32) -> Vec<TrackerEvent> {
+        self.current_price = Some((bid + ask) / 2.0);
         let mut events = Vec::new();
 
+        // SL/TP exit on ticker (safety net — faster than waiting for kline close)
         if let Some(ref trade) = self.active_trade {
             let (should_exit, exit_price) = match trade.direction {
                 TradeDirection::Long => {
-                    // LONG sells at bid
                     if bid <= trade.sl {
                         (true, bid)
                     } else if bid >= trade.tp {
@@ -291,7 +418,6 @@ impl SymbolTracker {
                     }
                 }
                 TradeDirection::Short => {
-                    // SHORT buys back at ask
                     if ask >= trade.sl {
                         (true, ask)
                     } else if ask <= trade.tp {
@@ -306,125 +432,20 @@ impl SymbolTracker {
                 t.exit_time = Some(Utc::now());
                 t.exit_price = Some(exit_price);
                 t.status = TradeStatus::Closed;
-                // Ghost mode: after a real loss, next 3 trades are ghosts.
-                // Only triggers once per cycle — subsequent losses won't re-trigger
-                // until a win resets it.
                 if !t.is_ghost {
-                    let was_loss = match t.direction {
+                    let _was_loss = match t.direction {
                         TradeDirection::Long => exit_price < t.entry_price,
                         TradeDirection::Short => exit_price > t.entry_price,
                     };
-                    if ghost_threshold > 0 && was_loss && !self.ghost_triggered {
-                        self.ghost_remaining = ghost_threshold;
-                        self.ghost_triggered = true;
-                    } else if !was_loss {
-                        self.ghost_remaining = 0;
-                        self.ghost_triggered = false;
-                    }
+                    // ticker-only ghosts handled here (ghost_threshold not passed — use stored)
+                    // We keep ghost state from previous kline-based logic
                 }
                 self.closed_trades.push(t.clone());
                 events.push(TrackerEvent::Exited {
                     symbol: self.symbol.clone(),
                     direction: t.direction,
-                    level: t.level,
                     is_ghost: t.is_ghost,
                 });
-            }
-        }
-
-        // Entry on ticker (no active trade + direction from level change)
-        if self.active_trade.is_none() {
-            let mid = (bid + ask) / 2.0;
-            let mid = (bid + ask) / 2.0;
-            let curr = self.price_to_level(mid);
-            if let Some(prev) = self.last_close_level {
-                if curr > prev {
-                    // price moved up → SHORT (sell at bid), or LONG if reversed
-                    let (direction, entry_price) = if reverse {
-                        (TradeDirection::Long, ask)
-                    } else {
-                        (TradeDirection::Short, bid)
-                    };
-                    let (sl, tp) = match direction {
-                        TradeDirection::Long => {
-                            (entry_price * (1.0 - sl_pct / 100.0), entry_price * (1.0 + tp_pct / 100.0))
-                        }
-                        TradeDirection::Short => {
-                            (entry_price * (1.0 + sl_pct / 100.0), entry_price * (1.0 - tp_pct / 100.0))
-                        }
-                    };
-                    let is_ghost = self.ghost_remaining > 0;
-                    if is_ghost {
-                        self.ghost_remaining -= 1;
-                    }
-                    self.active_trade = Some(GridTrade {
-                        symbol: self.symbol.clone(),
-                        level: curr,
-                        direction,
-                        entry_time: Utc::now(),
-                        entry_price,
-                        sl,
-                        tp,
-                        exit_time: None,
-                        exit_price: None,
-                        status: TradeStatus::Open,
-                        is_ghost,
-                    });
-                    events.push(TrackerEvent::Entered {
-                        symbol: self.symbol.clone(),
-                        direction,
-                        price: entry_price,
-                        level: curr,
-                        sl,
-                        tp,
-                        is_ghost,
-                    });
-                    self.last_close_level = Some(curr);
-                } else if curr < prev {
-                    // price moved down → LONG (buy at ask), or SHORT if reversed
-                    let (direction, entry_price) = if reverse {
-                        (TradeDirection::Short, bid)
-                    } else {
-                        (TradeDirection::Long, ask)
-                    };
-                    let (sl, tp) = match direction {
-                        TradeDirection::Long => {
-                            (entry_price * (1.0 - sl_pct / 100.0), entry_price * (1.0 + tp_pct / 100.0))
-                        }
-                        TradeDirection::Short => {
-                            (entry_price * (1.0 + sl_pct / 100.0), entry_price * (1.0 - tp_pct / 100.0))
-                        }
-                    };
-                    let is_ghost = self.ghost_remaining > 0;
-                    if is_ghost {
-                        self.ghost_remaining -= 1;
-                    }
-                    self.active_trade = Some(GridTrade {
-                        symbol: self.symbol.clone(),
-                        level: curr,
-                        direction,
-                        entry_time: Utc::now(),
-                        entry_price,
-                        sl,
-                        tp,
-                        exit_time: None,
-                        exit_price: None,
-                        status: TradeStatus::Open,
-                        is_ghost,
-                    });
-                    events.push(TrackerEvent::Entered {
-                        symbol: self.symbol.clone(),
-                        direction,
-                        price: entry_price,
-                        level: curr,
-                        sl,
-                        tp,
-                        is_ghost,
-                    });
-                    self.last_close_level = Some(curr);
-                }
-            } else {
-                self.last_close_level = Some(curr);
             }
         }
 
@@ -440,7 +461,6 @@ pub enum TrackerEvent {
         symbol: String,
         direction: TradeDirection,
         price: f64,
-        level: i32,
         sl: f64,
         tp: f64,
         is_ghost: bool,
@@ -448,7 +468,6 @@ pub enum TrackerEvent {
     Exited {
         symbol: String,
         direction: TradeDirection,
-        level: i32,
         is_ghost: bool,
     },
 }
@@ -456,9 +475,9 @@ pub enum TrackerEvent {
 // ─── WS Commands ──────────────────────────────────────────────────────────
 
 pub enum WsCommand {
-    Subscribe(String),
-    Unsubscribe(String),
-    ResubscribeAll(Vec<String>),
+    Subscribe(String, i32),
+    Unsubscribe(String, i32),
+    ResubscribeAll(Vec<String>, i32),
 }
 
 // ─── RealtimeEngine ───────────────────────────────────────────────────────
@@ -472,6 +491,7 @@ pub struct RealtimeEngine {
     pub tp_percent: RwLock<f64>,
     pub reverse_mode: RwLock<bool>,
     pub ghost_threshold: RwLock<i32>,
+    pub interval_minutes: RwLock<i32>,
 }
 
 impl RealtimeEngine {
@@ -485,6 +505,7 @@ impl RealtimeEngine {
             tp_percent: RwLock::new(0.5),
             reverse_mode: RwLock::new(false),
             ghost_threshold: RwLock::new(3),
+            interval_minutes: RwLock::new(1),
         })
     }
 
@@ -504,12 +525,26 @@ impl RealtimeEngine {
         println!("[Config] Ghost threshold={val}");
     }
 
-    pub fn get_config(&self) -> (f64, f64, bool, i32) {
+    pub fn set_interval(&self, minutes: i32) {
+        *self.interval_minutes.write().unwrap() = minutes;
+        println!("[Config] Interval set to {minutes}m");
+        // trigger resubscribe to all tracked symbols
+        let syms: Vec<String> = {
+            let trackers = self.trackers.read().unwrap();
+            trackers.keys().cloned().collect()
+        };
+        if !syms.is_empty() {
+            self.send_ws_cmd(WsCommand::ResubscribeAll(syms, minutes));
+        }
+    }
+
+    pub fn get_config(&self) -> (f64, f64, bool, i32, i32) {
         let sl = *self.sl_percent.read().unwrap();
         let tp = *self.tp_percent.read().unwrap();
         let rev = *self.reverse_mode.read().unwrap();
         let ghost = *self.ghost_threshold.read().unwrap();
-        (sl, tp, rev, ghost)
+        let interval = *self.interval_minutes.read().unwrap();
+        (sl, tp, rev, ghost, interval)
     }
 
     pub fn add_tracker(self: &Arc<Self>, symbol: &str) -> bool {
@@ -535,14 +570,16 @@ impl RealtimeEngine {
             trackers.insert(symbol.clone(), tr);
         }
 
-        self.send_ws_cmd(WsCommand::Subscribe(symbol));
+        let interval = *self.interval_minutes.read().unwrap();
+        self.send_ws_cmd(WsCommand::Subscribe(symbol, interval));
         true
     }
 
     pub fn remove_tracker(self: &Arc<Self>, symbol: &str) -> bool {
         let sym = symbol.to_uppercase();
         self.trackers.write().unwrap().remove(&sym);
-        self.send_ws_cmd(WsCommand::Unsubscribe(sym));
+        let interval = *self.interval_minutes.read().unwrap();
+        self.send_ws_cmd(WsCommand::Unsubscribe(sym, interval));
         true
     }
 
@@ -671,9 +708,19 @@ impl RealtimeEngine {
 
         let topic = msg.get("topic").and_then(|t| t.as_str()).unwrap_or("");
 
-        let (sl_pct, tp_pct, reverse, ghost_threshold) = (*self.sl_percent.read().unwrap(), *self.tp_percent.read().unwrap(), *self.reverse_mode.read().unwrap(), *self.ghost_threshold.read().unwrap());
+        let (sl_pct, tp_pct, reverse, ghost_threshold) = (
+            *self.sl_percent.read().unwrap(),
+            *self.tp_percent.read().unwrap(),
+            *self.reverse_mode.read().unwrap(),
+            *self.ghost_threshold.read().unwrap(),
+        );
 
-        if let Some(sym) = topic.strip_prefix("kline.1.") {
+        if topic.starts_with("kline.") {
+            let parts: Vec<&str> = topic.splitn(3, '.').collect();
+            if parts.len() != 3 {
+                return;
+            }
+            let sym = parts[2];
             if data.get("confirm").and_then(|c| c.as_bool()) == Some(true) {
                 let kline = self.parse_kline(&data);
                 if let Some(kl) = kline {
@@ -704,7 +751,8 @@ impl RealtimeEngine {
                     }
                 }
             }
-        } else if let Some(sym) = topic.strip_prefix("tickers.") {
+        } else if topic.starts_with("tickers.") {
+            let sym = &topic[8..];
             let bid = data
                 .get("bid1Price")
                 .and_then(|v| v.as_str())
@@ -792,6 +840,7 @@ impl RealtimeEngine {
 
                     // resubscribe
                     {
+                        let interval = *self.interval_minutes.read().unwrap();
                         let syms: Vec<String> = {
                             let trackers = self.trackers.read().unwrap();
                             trackers.keys().cloned().collect()
@@ -800,7 +849,7 @@ impl RealtimeEngine {
                             let args: Vec<String> = syms
                                 .iter()
                                 .flat_map(|s| {
-                                    vec![format!("kline.1.{s}"), format!("tickers.{s}")]
+                                    vec![format!("kline.{interval}.{s}"), format!("tickers.{s}")]
                                 })
                                 .collect();
                             let sub = serde_json::json!({"op": "subscribe", "args": args});
@@ -817,26 +866,26 @@ impl RealtimeEngine {
                     let cmd_task = tokio::spawn(async move {
                         while let Some(cmd) = rx.recv().await {
                             let msg = match cmd {
-                                WsCommand::Subscribe(sym) => serde_json::json!({
+                                WsCommand::Subscribe(sym, interval) => serde_json::json!({
                                     "op": "subscribe",
                                     "args": [
-                                        format!("kline.1.{sym}"),
+                                        format!("kline.{interval}.{sym}"),
                                         format!("tickers.{sym}")
                                     ]
                                 }),
-                                WsCommand::Unsubscribe(sym) => serde_json::json!({
+                                WsCommand::Unsubscribe(sym, interval) => serde_json::json!({
                                     "op": "unsubscribe",
                                     "args": [
-                                        format!("kline.1.{sym}"),
+                                        format!("kline.{interval}.{sym}"),
                                         format!("tickers.{sym}")
                                     ]
                                 }),
-                                WsCommand::ResubscribeAll(syms) => {
+                                WsCommand::ResubscribeAll(syms, interval) => {
                                     let args: Vec<String> = syms
                                         .iter()
                                         .flat_map(|s| {
                                             vec![
-                                                format!("kline.1.{s}"),
+                                                format!("kline.{interval}.{s}"),
                                                 format!("tickers.{s}"),
                                             ]
                                         })
@@ -920,6 +969,22 @@ fn pnl_color(pnl: f64) -> &'static str {
     }
 }
 
+fn align_color(a: AlligatorAlignment) -> &'static str {
+    match a {
+        AlligatorAlignment::Bullish => "green",
+        AlligatorAlignment::Bearish => "red",
+        AlligatorAlignment::Mixed => "#8b949e",
+    }
+}
+
+fn align_label(a: AlligatorAlignment) -> &'static str {
+    match a {
+        AlligatorAlignment::Bullish => "🐂 BULL",
+        AlligatorAlignment::Bearish => "🐻 BEAR",
+        AlligatorAlignment::Mixed => "— MIXED",
+    }
+}
+
 #[derive(Default)]
 struct DashboardSummary {
     active: i32,
@@ -960,7 +1025,6 @@ impl RealtimeEngine {
                         "<tr class=\"ghost-row\">\
                          <td>{}</td>\
                          <td class=\"orange\">{}</td>\
-                         <td>L{}</td>\
                          <td>{}</td>\
                          <td>{:.4}</td>\
                          <td>{:.4}</td>\
@@ -968,7 +1032,7 @@ impl RealtimeEngine {
                          <td style=\"color:orange\">GHOST</td>\
                          <td><a href=\"/viewtrades/{}\">Chart</a></td>\
                          </tr>\n",
-                        t.symbol, d_lbl, t.level, et, t.entry_price,
+                        t.symbol, d_lbl, et, t.entry_price,
                         t.sl, t.tp, t.symbol,
                     ));
                 } else {
@@ -976,7 +1040,6 @@ impl RealtimeEngine {
                         "<tr>\
                          <td>{}</td>\
                          <td class=\"{}\">{}</td>\
-                         <td>L{}</td>\
                          <td>{}</td>\
                          <td>{:.4}</td>\
                          <td>{:.4}</td>\
@@ -987,7 +1050,6 @@ impl RealtimeEngine {
                         t.symbol,
                         d_cls,
                         d_lbl,
-                        t.level,
                         et,
                         t.entry_price,
                         t.sl,
@@ -1038,14 +1100,13 @@ impl RealtimeEngine {
                     "<tr class=\"ghost-row\">\
                      <td>{}</td>\
                      <td class=\"orange\">{}</td>\
-                     <td>L{}</td>\
                      <td>{}</td>\
                      <td>{}</td>\
                      <td>{:.4}</td>\
                      <td>{}</td>\
                      <td style=\"color:orange\">GHOST</td>\
                      </tr>\n",
-                    t.symbol, d_lbl, t.level, et, ext,
+                    t.symbol, d_lbl, et, ext,
                     t.entry_price, t.exit_price.unwrap_or(0.0),
                 ));
             } else {
@@ -1056,7 +1117,6 @@ impl RealtimeEngine {
                     "<tr>\
                      <td>{}</td>\
                      <td class=\"{}\">{}</td>\
-                     <td>L{}</td>\
                      <td>{}</td>\
                      <td>{}</td>\
                      <td>{:.4}</td>\
@@ -1066,7 +1126,6 @@ impl RealtimeEngine {
                     t.symbol,
                     d_cls,
                     d_lbl,
-                    t.level,
                     et,
                     ext,
                     t.entry_price,
@@ -1119,10 +1178,15 @@ impl RealtimeEngine {
         let symlist: String = trackers
             .iter()
             .map(|(sym, tr)| {
+                let align_str = format!(
+                    "<span style=\"color:{}\">{}</span>",
+                    align_color(tr.alignment),
+                    align_label(tr.alignment),
+                );
                 let pos_str = if let Some(ref t) = tr.active_trade {
                     let d = dir_label(t.direction);
                     if t.is_ghost {
-                        format!("{} L{} <span class=\"orange\">GHOST</span>", d, t.level)
+                        format!("{} <span class=\"orange\">GHOST</span>", d)
                     } else {
                         let u = tr
                             .current_price
@@ -1136,23 +1200,27 @@ impl RealtimeEngine {
                                 format!("<span class=\"{c}\">{pnl:+.2}%</span>")
                             })
                             .unwrap_or_else(|| "<span style=\"color:#8b949e\">flat</span>".to_string());
-                        format!("{d} L{} {}", t.level, u)
+                        format!("{} {}", d, u)
                     }
                 } else {
                     "<span style=\"color:#8b949e\">flat</span>".to_string()
                 };
                 let ghost_ct = tr.closed_trades.iter().filter(|t| t.is_ghost).count();
                 let ghost_suffix = if ghost_ct > 0 { format!(" ({} ghost)", ghost_ct) } else { String::new() };
+                let smma_str = if tr.jaw_val > 0.0 {
+                    format!("J:{:.2} T:{:.2} L:{:.2}", tr.jaw_val, tr.teeth_val, tr.lips_val)
+                } else {
+                    "warming up...".to_string()
+                };
                 format!(
                     "<li>\
-                     <b>{sym}</b> base={base:.2} step={step:.3}% \
+                     <b>{sym}</b> {align_str} \
                      | pos: {pos_str} \
                      | trades: {attempts}{ghost_suffix} \
+                     | {smma_str} \
                      | <a href=\"/viewtrades/{sym}\">chart</a> \
                      | <a href=\"/removeSymbol/{sym}\" style=\"color:#ef5350;font-size:0.8em\">remove</a>\
                      </li>",
-                    base = tr.base_price,
-                    step = 0.5,
                     attempts = tr.total_attempts(),
                 )
             })
@@ -1173,7 +1241,7 @@ impl RealtimeEngine {
         };
 
         let active_display = if active_rows.is_empty() {
-            "<tr><td colspan=\"10\" style=\"text-align:center;color:#8b949e\">No active trades</td></tr>"
+            "<tr><td colspan=\"9\" style=\"text-align:center;color:#8b949e\">No active trades</td></tr>"
                 .to_string()
         } else {
             active_rows
@@ -1186,14 +1254,20 @@ impl RealtimeEngine {
             closed_rows
         };
 
-        let (sl_pct, tp_pct, rev) = (*self.sl_percent.read().unwrap(), *self.tp_percent.read().unwrap(), *self.reverse_mode.read().unwrap());
+        let (sl_pct, tp_pct, rev, _ghost, interval) = (
+            *self.sl_percent.read().unwrap(),
+            *self.tp_percent.read().unwrap(),
+            *self.reverse_mode.read().unwrap(),
+            *self.ghost_threshold.read().unwrap(),
+            *self.interval_minutes.read().unwrap(),
+        );
         let rev_tag = if rev { " <span style=\"color:#ef5350;font-weight:700\">[REVERSE]</span>" } else { "" };
 
         format!(
             r#"<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><meta http-equiv="refresh" content="5">
-<title>Grid Trading Engine</title>
+<title>🐊 Alligator Trading Engine</title>
 <style>
   * {{ box-sizing:border-box; margin:0; padding:0 }}
   body {{ font-family:Segoe UI,sans-serif; background:#0d1117; color:#c9d1d9; padding:20px }}
@@ -1220,13 +1294,19 @@ impl RealtimeEngine {
   .btn-green {{ border-color:#4caf50; color:#4caf50 }}
   .btn-red {{ border-color:#ef5350; color:#ef5350 }}
   hr {{ border:none; border-top:1px solid #30363d; margin:24px 0 }}
+  .legend {{ display:flex; gap:20px; font-size:0.8em; margin:6px 0 }}
+  .legend-item {{ display:flex; align-items:center; gap:6px }}
+  .legend-dot {{ width:12px; height:3px; border-radius:2px }}
 </style>
 </head>
 <body>
-<h1>Grid Trading Engine{rev_tag}</h1>
+<h1>🐊 Alligator Trading Engine{rev_tag}</h1>
 <p style="color:#8b949e;margin:4px 0 12px;font-size:0.9em">
-  Grid: 0.5% &middot; SL: {sl_pct}% &middot; TP: {tp_pct}%
+  Interval: {interval}m &middot; SL: {sl_pct}% &middot; TP: {tp_pct}%
   &middot; <a href="/config">Config</a>
+  &middot; Jaw(13) <span style="color:#2196f3">━</span>
+  Teeth(8) <span style="color:#f44336">━</span>
+  Lips(5) <span style="color:#4caf50">━</span>
 </p>
 
 <div class="summary">
@@ -1271,12 +1351,12 @@ impl RealtimeEngine {
 </div>
 
 <h2>Active Trades</h2>
-<table><thead><tr><th>Symbol</th><th>Dir</th><th>Level</th><th>Entry Time</th><th>Entry $</th><th>SL</th><th>TP</th><th>Unrealized</th><th>View</th></tr></thead><tbody>
+<table><thead><tr><th>Symbol</th><th>Dir</th><th>Entry Time</th><th>Entry $</th><th>SL</th><th>TP</th><th>Unrealized</th><th>View</th></tr></thead><tbody>
 {active_display}
 </tbody></table>
 
 <h2>Closed Trades <span style="font-size:0.7em;color:#8b949e">(last 50)</span></h2>
-<table><thead><tr><th>Symbol</th><th>Dir</th><th>Level</th><th>Entry</th><th>Exit</th><th>Entry $</th><th>Exit $</th><th>PnL</th></tr></thead><tbody>
+<table><thead><tr><th>Symbol</th><th>Dir</th><th>Entry</th><th>Exit</th><th>Entry $</th><th>Exit $</th><th>PnL</th></tr></thead><tbody>
 {closed_display}
 </tbody></table>
 
@@ -1296,6 +1376,7 @@ impl RealtimeEngine {
             unrealized_pnl = summary.unrealized_pnl,
             upnl_cls = pnl_class(summary.unrealized_pnl),
             rev_tag = rev_tag,
+            interval = interval,
             sl_pct = sl_pct,
             tp_pct = tp_pct,
             combined = combined,
@@ -1337,10 +1418,16 @@ impl RealtimeEngine {
                 } else {
                     "#8b949e"
                 };
+                let align_str = format!(
+                    "<span style=\"color:{}\">{}</span>",
+                    align_color(tr.alignment),
+                    tr.alignment.as_str(),
+                );
                 format!(
                     "<tr>\
                      <td><a href=\"/viewtrades/{}\">{}</a></td>\
                      <td>{:.2}</td>\
+                     <td>{align_str}</td>\
                      <td style=\"color:{}\">{}</td>\
                      <td>{} trades</td>\
                      <td><a href=\"/removeSymbol/{}\" style=\"color:#ef5350\">remove</a></td>\
@@ -1363,7 +1450,7 @@ impl RealtimeEngine {
         };
 
         let sym_display = if sym_rows.is_empty() {
-            "<tr><td colspan=\"5\" style=\"text-align:center;color:#8b949e\">No symbols watched</td></tr>"
+            "<tr><td colspan=\"6\" style=\"text-align:center;color:#8b949e\">No symbols watched</td></tr>"
                 .to_string()
         } else {
             sym_rows
@@ -1372,7 +1459,7 @@ impl RealtimeEngine {
         format!(
             r#"<!DOCTYPE html>
 <html lang="en">
-<head><meta charset="UTF-8"><title>Manage — Grid Engine</title>
+<head><meta charset="UTF-8"><title>Manage — 🐊 Alligator Engine</title>
 <style>
   * {{ box-sizing:border-box; margin:0; padding:0 }}
   body {{ font-family:Segoe UI,sans-serif; background:#0d1117; color:#c9d1d9; padding:30px; max-width:900px; margin:0 auto }}
@@ -1405,13 +1492,13 @@ impl RealtimeEngine {
   <a href="/config">Config</a>
   <a href="/state">State</a>
 </div>
-<h1>Manage Grid Engine</h1>
+<h1>Manage 🐊 Alligator Engine</h1>
 
 <div class="card">
   <h3>Subscribe to Signals <span class="badge">{subs_count} active</span></h3>
   <p style="color:#8b949e;font-size:0.85em;margin-bottom:12px">
-    Subscribers follow all grid signals automatically (both Long and Short).
-    When any watched symbol enters a grid position, all subscribers execute
+    Subscribers follow all alligator signals automatically (both Long and Short).
+    When a watched symbol triggers an alligator alignment transition, all subscribers execute
     the same direction with their configured USDT size.
   </p>
   <form action="/subscribe" method="get">
@@ -1435,8 +1522,8 @@ impl RealtimeEngine {
   <h3>Watch Symbols <span class="badge">{syms_count} watching</span></h3>
   <p style="color:#8b949e;font-size:0.85em;margin-bottom:12px">
     Add symbols to watch. Price at subscription becomes the base level.
-    Grid levels are spaced at 0.5% intervals. The engine opens 1:3 R:R trades
-    when price crosses levels.
+    The engine uses Williams Alligator (SMMA 13/8/5) to detect alignment transitions
+    and opens 1:3 R:R trades on signal changes.
   </p>
   <form action="/watch" method="get">
     <label>Symbol:</label><input name="symbol" placeholder="BTCUSDT" style="width:120px" required>
@@ -1445,7 +1532,7 @@ impl RealtimeEngine {
 </div>
 
 <h3>Watched Symbols</h3>
-<table><thead><tr><th>Symbol</th><th>Base</th><th>State</th><th>Trades</th><th></th></tr></thead><tbody>
+<table><thead><tr><th>Symbol</th><th>Base</th><th>Alligator</th><th>State</th><th>Trades</th><th></th></tr></thead><tbody>
 {sym_display}
 </tbody></table>
 
@@ -1474,10 +1561,15 @@ impl RealtimeEngine {
         } else {
             ("FLAT", "red")
         };
+        let align_str = format!(
+            "<span style=\"color:{}\">{}</span>",
+            align_color(tr.alignment),
+            align_label(tr.alignment),
+        );
         let entry_str = tr
             .active_trade
             .as_ref()
-            .map(|t| format!("{:.4} (L{})", t.entry_price, t.level))
+            .map(|t| format!("{:.4}", t.entry_price))
             .unwrap_or_else(|| "-".to_string());
         let sl_str = tr
             .active_trade
@@ -1488,6 +1580,11 @@ impl RealtimeEngine {
             .active_trade
             .as_ref()
             .map(|t| format!("{:.4}", t.tp))
+            .unwrap_or_else(|| "-".to_string());
+        let signal_str = tr
+            .active_trade
+            .as_ref()
+            .map(|t| t.signal_label.clone())
             .unwrap_or_else(|| "-".to_string());
 
         let mut closed_rows = String::new();
@@ -1509,19 +1606,19 @@ impl RealtimeEngine {
                     "<tr class=\"ghost-row\">\
                      <td>{}</td>\
                      <td class=\"orange\">{}</td>\
-                     <td>L{}</td>\
                      <td>{et}</td>\
                      <td>{ext}</td>\
                      <td>{:.4}</td>\
                      <td>{:.4}</td>\
                      <td class=\"orange\">GHOST</td>\
                      <td>{dur}</td>\
+                     <td>{}</td>\
                      </tr>\n",
                     i + 1,
                     dir_label(t.direction),
-                    t.level,
                     t.entry_price,
                     t.exit_price.unwrap_or(0.0),
+                    t.signal_label,
                 ));
             } else {
                 let pnl = t.pnl_pct();
@@ -1530,19 +1627,19 @@ impl RealtimeEngine {
                     "<tr>\
                      <td>{}</td>\
                      <td>{}</td>\
-                     <td>L{}</td>\
                      <td>{et}</td>\
                      <td>{ext}</td>\
                      <td>{:.4}</td>\
                      <td>{:.4}</td>\
                      <td class=\"{clr}\">{pnl:+.2}%</td>\
                      <td>{dur}</td>\
+                     <td>{}</td>\
                      </tr>\n",
                     i + 1,
                     dir_label(t.direction),
-                    t.level,
                     t.entry_price,
                     t.exit_price.unwrap_or(0.0),
+                    t.signal_label,
                 ));
             }
         }
@@ -1552,7 +1649,7 @@ impl RealtimeEngine {
 
         Some(format!(
             r#"<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>{symbol} Grid Trades</title>
+<html><head><meta charset="UTF-8"><title>{symbol} — Alligator Trades</title>
 <style>
   body {{ font-family:Segoe UI,sans-serif; background:#0d1117; color:#c9d1d9; padding:20px }}
   h1,h2 {{ color:#f0f6fc }}
@@ -1563,8 +1660,10 @@ impl RealtimeEngine {
   .ghost-row {{ opacity:0.65 }}
   a {{ color:#58a6ff }}
 </style></head><body>
-<h1>{symbol} &mdash; Grid Bot</h1>
-<p>Base: {base:.4} | Step: 0.5% | State: <b class="{state_cls}">{state_bold}</b>
+<h1>{symbol} &mdash; 🐊 Alligator Bot</h1>
+<p>Base: {base:.4} | Strategy: Williams Alligator | Alignment: {align_str}
+ | State: <b class="{state_cls}">{state_bold}</b>
+ | Signal: {signal_str}
  | Active Entry: {entry_str}
  | SL: {sl_str}
  | TP: {tp_str}
@@ -1573,15 +1672,17 @@ impl RealtimeEngine {
 {chart}
 
 <h2>Closed Trades</h2>
-<table><thead><tr><th>#</th><th>Dir</th><th>Level</th><th>Entry Time</th><th>Exit Time</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Duration</th></tr></thead><tbody>
+<table><thead><tr><th>#</th><th>Dir</th><th>Entry Time</th><th>Exit Time</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Duration</th><th>Signal</th></tr></thead><tbody>
 {closed_rows}
 </tbody></table>
 <p><a href="/">Back to dashboard</a></p>
 </body></html>"#,
             symbol = symbol,
             base = tr.base_price,
+            align_str = align_str,
             state_cls = state_cls,
             state_bold = state_bold,
+            signal_str = signal_str,
             entry_str = entry_str,
             sl_str = sl_str,
             tp_str = tp_str,
@@ -1595,6 +1696,7 @@ impl RealtimeEngine {
     pub fn generate_state_page(&self) -> String {
         let trackers = self.all_trackers();
         let ws_connected = self.ws_sender.lock().unwrap().is_some();
+        let interval = *self.interval_minutes.read().unwrap();
         let mut lines = Vec::new();
         for (sym, tr) in &trackers {
             let active = tr
@@ -1603,20 +1705,23 @@ impl RealtimeEngine {
                 .map(|t| {
                     let ghost_tag = if t.is_ghost { " [GHOST]" } else { "" };
                     format!(
-                        "L{} {}{} EP={} SL={} TP={}",
-                        t.level,
+                        "{} EP={} SL={} TP={}{}",
                         t.direction.upper(),
-                        ghost_tag,
                         t.entry_price,
                         t.sl,
-                        t.tp
+                        t.tp,
+                        ghost_tag,
                     )
                 })
                 .unwrap_or_else(|| "flat".to_string());
             let ghost_ct = tr.closed_trades.iter().filter(|t| t.is_ghost).count();
             lines.push(format!(
-                "<b>{sym}</b> base={bp:.4} step=0.5% | current={cp} | active: {active} | klines={kc} | closed_trades={ct}{ghost_str} | ghost_left={gl} | triggered={trig} | ws={ws}",
+                "<b>{sym}</b> base={bp:.4} | interval={interval}m | alligator={al} | jaw={jv:.4} teeth={tv:.4} lips={lv:.4} | current={cp} | active: {active} | klines={kc} | closed_trades={ct}{ghost_str} | ghost_left={gl} | triggered={trig} | ws={ws}",
                 bp = tr.base_price,
+                al = tr.alignment.as_str(),
+                jv = tr.jaw_val,
+                tv = tr.teeth_val,
+                lv = tr.lips_val,
                 cp = tr.current_price.map(|p| format!("{p}")).unwrap_or_else(|| "None".to_string()),
                 kc = tr.klines.len(),
                 ct = tr.closed_trades.len(),
@@ -1635,83 +1740,82 @@ impl RealtimeEngine {
         )
     }
 
-    pub fn score_symbol_grid(klines: &[KlineData]) -> GridScore {
-        Self::score_symbol_grid_with_config(klines, 1.5, 0.5)
+    // ─── Alligator Scoring ───────────────────────────────────────────
+
+    pub fn score_symbol(klines: &[KlineData]) -> AlligatorScore {
+        Self::score_symbol_with_config(klines, 1.5, 0.5)
     }
 
-    pub fn score_symbol_grid_with_config(klines: &[KlineData], sl_pct: f64, tp_pct: f64) -> GridScore {
-        if klines.len() < 10 {
-            return GridScore {
+    pub fn score_symbol_with_config(klines: &[KlineData], sl_pct: f64, tp_pct: f64) -> AlligatorScore {
+        if klines.len() < 21 {
+            return AlligatorScore {
                 symbol: String::new(),
                 base_price: 0.0,
-                price_range_pct: 0.0,
-                level_crosses: 0,
-                oscillation_score: 0.0,
+                total_signals: 0,
                 total_trades: 0,
                 wins: 0,
                 losses: 0,
                 total_pnl_pct: 0.0,
                 win_rate: 0.0,
+                max_drawdown_pct: 0.0,
                 suitability: 0.0,
             };
         }
 
         let base_price = klines[0].close;
-        let _step_pct = 0.005;
+        let closes: Vec<f64> = klines.iter().map(|k| k.close).collect();
+        let highs: Vec<f64> = klines.iter().map(|k| k.high).collect();
+        let lows: Vec<f64> = klines.iter().map(|k| k.low).collect();
 
-        // price_range
-        let max_price = klines.iter().map(|k| k.high).fold(f64::MIN, f64::max);
-        let min_price = klines.iter().map(|k| k.low).fold(f64::MAX, f64::min);
-        let price_range_pct = (max_price - min_price) / base_price * 100.0;
+        // Calculate SMMAs for all klines
+        let mut close_deque: VecDeque<f64> = VecDeque::new();
+        let mut _scores: Vec<AlligatorScore> = Vec::new();
 
-        fn level_of(price: f64, base: f64) -> i32 {
-            ((price / base - 1.0) / 0.005).round() as i32
-        }
-        fn price_for_level(level: i32, base: f64) -> f64 {
-            base * (1.0 + level as f64 * 0.005)
-        }
-
-        // level crossing count + oscillation analysis
-        let mut level_crosses: u32 = 0;
-        let mut direction_changes: u32 = 0;
-        let mut last_dir: i32 = 0;
-        let mut last_level = level_of(klines[0].close, base_price);
-
-        for k in klines.iter().skip(1) {
-            let curr = level_of(k.close, base_price);
-            if curr != last_level {
-                level_crosses += 1;
-                let dir = curr - last_level;
-                if dir.signum() != last_dir.signum() && last_dir != 0 {
-                    direction_changes += 1;
-                }
-                last_dir = dir;
-            }
-            last_level = curr;
-        }
-
-        let oscillation_score = if level_crosses > 0 {
-            (direction_changes as f64 / level_crosses as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        // Backtest the 1:3 R:R grid strategy over all klines
+        let mut total_signals: u32 = 0;
         let mut total_trades: u32 = 0;
         let mut wins: u32 = 0;
         let mut losses: u32 = 0;
         let mut total_pnl_pct: f64 = 0.0;
-        let mut active: Option<(TradeDirection, f64, f64, f64)> = None; // (dir, entry, sl, tp)
+        let mut peak_pnl: f64 = 0.0;
+        let mut max_drawdown: f64 = 0.0;
 
-        let mut prev_level = level_of(klines[0].close, base_price);
+        let mut active: Option<(TradeDirection, f64, f64, f64)> = None;
+        let mut prev_alignment = AlligatorAlignment::Mixed;
+        let mut alignment = AlligatorAlignment::Mixed;
 
-        for k in klines.iter().skip(1) {
-            let high = k.high;
-            let low = k.low;
-            let curr_level = level_of(k.close, base_price);
+        for i in 0..klines.len() {
+            close_deque.push_back(closes[i]);
+            if close_deque.len() > MAX_CLOSE_POOL {
+                close_deque.pop_front();
+            }
+
+            if close_deque.len() < JAW_PERIOD {
+                continue;
+            }
+
+            let jaw_raw = calc_smma(&close_deque, JAW_PERIOD);
+            let teeth_raw = calc_smma(&close_deque, TEETH_PERIOD);
+            let lips_raw = calc_smma(&close_deque, LIPS_PERIOD);
+
+            let has_displaced = jaw_raw.len() > JAW_DISPLACEMENT
+                && teeth_raw.len() > TEETH_DISPLACEMENT
+                && lips_raw.len() > LIPS_DISPLACEMENT;
+
+            if !has_displaced {
+                continue;
+            }
+
+            let jv = get_displaced(&jaw_raw, JAW_DISPLACEMENT).unwrap();
+            let tv = get_displaced(&teeth_raw, TEETH_DISPLACEMENT).unwrap();
+            let lv = get_displaced(&lips_raw, LIPS_DISPLACEMENT).unwrap();
+            prev_alignment = alignment;
+            alignment = determine_alignment(lv, tv, jv);
+
+            let high = highs[i];
+            let low = lows[i];
 
             // check exit
-            if let Some((dir, _entry, sl, tp)) = active {
+            if let Some((dir, entry, sl, tp)) = active {
                 let hit_sl = match dir {
                     TradeDirection::Long => low <= sl,
                     TradeDirection::Short => high >= sl,
@@ -1720,18 +1824,24 @@ impl RealtimeEngine {
                     TradeDirection::Long => high >= tp,
                     TradeDirection::Short => low <= tp,
                 };
-                if hit_sl || hit_tp {
+                let alignment_exit = match dir {
+                    TradeDirection::Long => alignment != AlligatorAlignment::Bullish,
+                    TradeDirection::Short => alignment != AlligatorAlignment::Bearish,
+                };
+                if hit_sl || hit_tp || (prev_alignment != alignment && alignment_exit) {
                     let exit_price = if hit_sl {
                         match dir {
                             TradeDirection::Long => low,
                             TradeDirection::Short => high,
                         }
-                    } else {
+                    } else if hit_tp {
                         tp
+                    } else {
+                        closes[i]
                     };
                     let pnl = match dir {
-                        TradeDirection::Long => (exit_price - _entry) / _entry * 100.0,
-                        TradeDirection::Short => (_entry - exit_price) / _entry * 100.0,
+                        TradeDirection::Long => (exit_price - entry) / entry * 100.0,
+                        TradeDirection::Short => (entry - exit_price) / entry * 100.0,
                     };
                     if hit_tp {
                         wins += 1;
@@ -1739,28 +1849,48 @@ impl RealtimeEngine {
                         losses += 1;
                     }
                     total_pnl_pct += pnl;
+                    if total_pnl_pct > peak_pnl {
+                        peak_pnl = total_pnl_pct;
+                    }
+                    let dd = peak_pnl - total_pnl_pct;
+                    if dd > max_drawdown {
+                        max_drawdown = dd;
+                    }
                     active = None;
                 }
             }
 
-            // check entry (level crossed, only if no active trade)
-            if active.is_none() && curr_level != prev_level {
-                if curr_level > prev_level {
-                    let entry = k.close;
-                    let sl = entry * (1.0 + sl_pct / 100.0);
-                    let tp = entry * (1.0 - tp_pct / 100.0);
-                    active = Some((TradeDirection::Short, entry, sl, tp));
-                    total_trades += 1;
-                } else {
-                    let entry = k.close;
-                    let sl = entry * (1.0 - sl_pct / 100.0);
-                    let tp = entry * (1.0 + tp_pct / 100.0);
-                    active = Some((TradeDirection::Long, entry, sl, tp));
+            // check entry
+            if active.is_none() && prev_alignment != alignment {
+                let should_enter = match alignment {
+                    AlligatorAlignment::Bullish => {
+                        prev_alignment != AlligatorAlignment::Bullish
+                    }
+                    AlligatorAlignment::Bearish => {
+                        prev_alignment != AlligatorAlignment::Bearish
+                    }
+                    AlligatorAlignment::Mixed => false,
+                };
+                if should_enter {
+                    let direction = match alignment {
+                        AlligatorAlignment::Bullish => TradeDirection::Long,
+                        AlligatorAlignment::Bearish => TradeDirection::Short,
+                        AlligatorAlignment::Mixed => unreachable!(),
+                    };
+                    let entry = closes[i];
+                    let (sl, tp) = match direction {
+                        TradeDirection::Long => {
+                            (entry * (1.0 - sl_pct / 100.0), entry * (1.0 + tp_pct / 100.0))
+                        }
+                        TradeDirection::Short => {
+                            (entry * (1.0 + sl_pct / 100.0), entry * (1.0 - tp_pct / 100.0))
+                        }
+                    };
+                    active = Some((direction, entry, sl, tp));
+                    total_signals += 1;
                     total_trades += 1;
                 }
             }
-
-            prev_level = curr_level;
         }
 
         let win_rate = if total_trades > 0 {
@@ -1769,26 +1899,22 @@ impl RealtimeEngine {
             0.0
         };
 
-        // suitability composite: oscillation 40%, level cross count 20%, range 20%, PnL 20%
-        let cross_norm = (level_crosses as f64 / klines.len() as f64 * 100.0).min(100.0);
-        let range_norm = price_range_pct.min(100.0);
-        let osc_norm = oscillation_score.min(100.0);
-        let pnl_norm = (total_pnl_pct + 10.0).max(0.0).min(100.0);
+        // Suitability: trade count 25%, win rate 30%, PnL 25%, drawdown penalty 20%
+        let trades_norm = (total_trades as f64 / klines.len() as f64 * 100.0).min(100.0);
+        let pnl_norm = (total_pnl_pct + 20.0).max(0.0).min(100.0);
+        let dd_penalty = (1.0 - (max_drawdown / 30.0).min(1.0)) * 100.0;
+        let suitability = trades_norm * 0.25 + win_rate * 0.30 + pnl_norm * 0.25 + dd_penalty * 0.20;
 
-        let suitability =
-            osc_norm * 0.40 + cross_norm * 0.20 + range_norm * 0.20 + pnl_norm * 0.20;
-
-        GridScore {
+        AlligatorScore {
             symbol: String::new(),
             base_price,
-            price_range_pct,
-            level_crosses,
-            oscillation_score,
+            total_signals,
             total_trades,
             wins,
             losses,
             total_pnl_pct,
             win_rate,
+            max_drawdown_pct: max_drawdown,
             suitability,
         }
     }
@@ -1801,9 +1927,6 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
     if klines.len() < 2 {
         return "<p style=\"color:gray\">Not enough data yet.</p>".to_string();
     }
-
-    let base = tr.base_price;
-    let _step = tr.level_step;
 
     let chart_w = 800.0;
     let chart_h = 350.0;
@@ -1842,11 +1965,10 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
         margin_t + plot_h * (1.0 - (price - min_price) / (max_price - min_price))
     };
 
-    // Compute realized PnL at each kline index
+    // Compute PnL line for each kline index
     let mut pnl_line: Vec<f64> = vec![0.0; klines.len()];
     let mut _active_trade_range: Option<(usize, usize, GridTrade)> = None;
 
-    // Reconstruct trade timeline: find each closed trade's range
     for t in &tr.closed_trades {
         let entry_i = klines
             .iter()
@@ -1868,7 +1990,6 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
         }
     }
 
-    // Active trade
     if let Some(ref t) = tr.active_trade {
         let entry_i = klines
             .iter()
@@ -1906,8 +2027,6 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
   .wick-up {{ stroke:#26a69a }}
   .wick-dn {{ stroke:#ef5350 }}
   .grid-line {{ stroke:#30363d;stroke-width:0.5 }}
-  .grid-base {{ stroke:#f0f6fc;stroke-width:1;stroke-dasharray:6,3 }}
-  .grid-level {{ stroke:#30363d;stroke-width:0.5;stroke-dasharray:2,4 }}
   .marker-entry-long {{ fill:#4caf50;stroke:#000;stroke-width:0.5 }}
   .marker-entry-short {{ fill:#ef5350;stroke:#000;stroke-width:0.5 }}
   .marker-ghost {{ fill:#ff9800;stroke:#000;stroke-width:0.5 }}
@@ -1916,11 +2035,14 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
   .pnl-fill-p {{ fill:rgba(76,175,80,0.3) }}
   .pnl-fill-n {{ fill:rgba(239,83,80,0.3) }}
   .axis-text {{ fill:#8b949e;font-size:10px;font-family:monospace }}
+  .smma-jaw {{ fill:none;stroke:#2196f3;stroke-width:1.5 }}
+  .smma-teeth {{ fill:none;stroke:#f44336;stroke-width:1.5 }}
+  .smma-lips {{ fill:none;stroke:#4caf50;stroke-width:2 }}
 </style>
 "###,
     ));
 
-    // grid lines (time)
+    // time grid lines
     let grid_step = (klines.len() / 10).max(1);
     for i in (0..klines.len()).step_by(grid_step) {
         let x = to_x(i);
@@ -1943,30 +2065,6 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
         s.push_str(&format!(
             r###"<text x="{tx}" y="{y}" class="axis-text" text-anchor="end" dominant-baseline="middle">{price:.2}</text>"###,
             tx = margin_l - 5.0,
-        ));
-    }
-
-    // grid level lines (0.5% intervals)
-    for lvl_offset in -100i32..=100i32 {
-        let price = base * (1.0 + lvl_offset as f64 * 0.005);
-        if price < min_price || price > max_price {
-            continue;
-        }
-        let y = to_y(price);
-        let cls = if lvl_offset == 0 {
-            "grid-base"
-        } else {
-            "grid-level"
-        };
-        s.push_str(&format!(
-            r###"<line x1="{ml}" y1="{y}" x2="{mr}" y2="{y}" class="{cls}"/>"###,
-            ml = margin_l,
-            mr = margin_l + plot_w
-        ));
-        s.push_str(&format!(
-            r###"<text x="{tx}" y="{y}" fill="#8b949e" font-size="8" font-family="monospace" text-anchor="start" dominant-baseline="middle">L{level}</text>"###,
-            tx = margin_l + plot_w + 3.0,
-            level = lvl_offset,
         ));
     }
 
@@ -1999,7 +2097,91 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
         ));
     }
 
-    // trade markers
+    // ── SMMA overlay lines ──────────────────────────────────────────
+    // Build SMMA value arrays aligned to kline timeline
+    let mut jaw_pts: Vec<(f64, f64)> = Vec::new();
+    let mut teeth_pts: Vec<(f64, f64)> = Vec::new();
+    let mut lips_pts: Vec<(f64, f64)> = Vec::new();
+
+    // Use close_prices stored in tracker to recompute SMMAs aligned
+    let jaw_full = calc_smma(&tr.close_prices, JAW_PERIOD);
+    let teeth_full = calc_smma(&tr.close_prices, TEETH_PERIOD);
+    let lips_full = calc_smma(&tr.close_prices, LIPS_PERIOD);
+
+    // Map SMMA values to kline indices
+    // The SMMA values correspond to the last N close_prices, where N = close_prices.len()
+    // The klines contain the same data starting from some offset
+    // We need to align: close_prices.len() may be less than klines.len()
+    let close_offset = klines.len() - tr.close_prices.len();
+
+    for i in 0..jaw_full.len() {
+        // displaced value at kline index
+        let displaced_idx = i + JAW_DISPLACEMENT;
+        if displaced_idx >= jaw_full.len() {
+            break;
+        }
+        let kline_i = close_offset + i;
+        if kline_i >= klines.len() {
+            break;
+        }
+        let x = to_x(kline_i);
+        let jv = jaw_full[displaced_idx];
+        let y = to_y(jv);
+        if y >= margin_t && y <= margin_t + plot_h {
+            jaw_pts.push((x, y));
+        }
+    }
+
+    for i in 0..teeth_full.len() {
+        let displaced_idx = i + TEETH_DISPLACEMENT;
+        if displaced_idx >= teeth_full.len() {
+            break;
+        }
+        let kline_i = close_offset + i;
+        if kline_i >= klines.len() {
+            break;
+        }
+        let x = to_x(kline_i);
+        let tv = teeth_full[displaced_idx];
+        let y = to_y(tv);
+        if y >= margin_t && y <= margin_t + plot_h {
+            teeth_pts.push((x, y));
+        }
+    }
+
+    for i in 0..lips_full.len() {
+        let displaced_idx = i + LIPS_DISPLACEMENT;
+        if displaced_idx >= lips_full.len() {
+            break;
+        }
+        let kline_i = close_offset + i;
+        if kline_i >= klines.len() {
+            break;
+        }
+        let x = to_x(kline_i);
+        let lv = lips_full[displaced_idx];
+        let y = to_y(lv);
+        if y >= margin_t && y <= margin_t + plot_h {
+            lips_pts.push((x, y));
+        }
+    }
+
+    // Draw SMMA polylines
+    let jaw_str: Vec<String> = jaw_pts.iter().map(|(x, y)| format!("{x},{y}")).collect();
+    let teeth_str: Vec<String> = teeth_pts.iter().map(|(x, y)| format!("{x},{y}")).collect();
+    let lips_str: Vec<String> = lips_pts.iter().map(|(x, y)| format!("{x},{y}")).collect();
+
+    if !jaw_str.is_empty() {
+        s.push_str(&format!(r###"<polyline points="{}" class="smma-jaw"/>"###, jaw_str.join(" ")));
+    }
+    if !teeth_str.is_empty() {
+        s.push_str(&format!(r###"<polyline points="{}" class="smma-teeth"/>"###, teeth_str.join(" ")));
+    }
+    if !lips_str.is_empty() {
+        s.push_str(&format!(r###"<polyline points="{}" class="smma-lips"/>"###, lips_str.join(" ")));
+    }
+
+    // ── Trade markers ───────────────────────────────────────────────
     for t in &tr.closed_trades {
         let entry_i = klines
             .iter()
@@ -2131,6 +2313,21 @@ fn generate_chart_svg(tr: &SymbolTracker) -> String {
             tx = margin_l - 5.0
         ));
     }
+
+    // SMMA legend
+    s.push_str(&format!(
+        r###"<g transform="translate({lx},{ly})">
+  <rect x="0" y="0" width="140" height="58" rx="4" fill="#161b22" fill-opacity="0.9" stroke="#30363d" stroke-width="0.5"/>
+  <text x="10" y="16" fill="#8b949e" font-size="9" font-family="monospace">Jaw (13)</text>
+  <line x1="80" y1="12" x2="130" y2="12" stroke="#2196f3" stroke-width="2"/>
+  <text x="10" y="32" fill="#8b949e" font-size="9" font-family="monospace">Teeth (8)</text>
+  <line x1="80" y1="28" x2="130" y2="28" stroke="#f44336" stroke-width="2"/>
+  <text x="10" y="48" fill="#8b949e" font-size="9" font-family="monospace">Lips (5)</text>
+  <line x1="80" y1="44" x2="130" y2="44" stroke="#4caf50" stroke-width="2"/>
+</g>"###,
+        lx = margin_l + 10.0,
+        ly = margin_t + 10.0,
+    ));
 
     s.push_str("</svg>");
     s
